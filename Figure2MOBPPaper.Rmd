@@ -1,0 +1,756 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+# Paths to LD matrix (r^2) and BIM file
+ld_path  <- "\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/1KG.EUR.onList.refLD.ld"
+bim_path <- "\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/1KG.EUR.onList.reid.bim"
+
+# Load LD (SNP x SNP) and BIM
+LD  <- as.matrix(read.table(ld_path, header = FALSE, check.names = FALSE))
+bim <- read.table(bim_path, header = FALSE, stringsAsFactors = FALSE)
+
+# Give BIM standard PLINK-style names (first 6 cols)
+colnames(bim)[1:6] <- c("CHR","ID","CM","POS","A1","A2")
+
+ld_ids <- bim$ID
+stopifnot(nrow(LD) == length(ld_ids))
+rownames(LD) <- colnames(LD) <- ld_ids
+
+# Correlation matrix R (SuSiE expects correlations rather than r^2)
+R_all <- LD
+R_all[R_all < 0] <- 0           # just in case
+R_all <- sqrt(R_all)
+
+# LD-allele reference table
+ld_ref <- data.frame(
+  snp    = bim$ID,
+  A1_ref = toupper(bim$A1),
+  A2_ref = toupper(bim$A2)
+)
+```
+
+
+
+```{r}
+
+```
+
+```{r}
+library(dplyr)
+library(susieR)
+
+attach_ld_cc <- function(ds, trait_label) {
+
+  # match to LD reference
+  idx <- match(ds$snp, ld_ref$snp)
+  keep <- !is.na(idx)
+
+  if (sum(keep) < 10) {
+    warning(trait_label, ": only ", sum(keep), " SNPs match LD reference")
+  }
+
+  # subset all vectors to SNPs present in LD ref
+  ds$snp     <- ds$snp[keep]
+  ds$beta    <- ds$beta[keep]
+  ds$varbeta <- ds$varbeta[keep]
+  ds$MAF     <- ds$MAF[keep]
+  ds$A1      <- ds$A1[keep]
+  ds$A2      <- ds$A2[keep]
+  ds$REF     <- ds$REF[keep]
+  ds$ALT     <- ds$ALT[keep]
+  if (!is.null(ds$pos)) ds$pos <- ds$pos[keep]
+
+  a1_ref <- ld_ref$A1_ref[idx[keep]]
+  a2_ref <- ld_ref$A2_ref[idx[keep]]
+
+  # flip where A1 is the other allele
+  flip <- ds$A1 != a1_ref & ds$A1 == a2_ref
+  ds$beta[flip] <- -ds$beta[flip]
+
+  # drop any remaining incompatible alleles (should be rare)
+  mismatch <- !( (ds$A1 == a1_ref & ds$A2 == a2_ref) |
+                 (ds$A1 == a2_ref & ds$A2 == a1_ref) )
+  if (any(mismatch)) {
+    message(trait_label, ": dropping ", sum(mismatch),
+            " SNPs with incompatible alleles vs LD ref")
+    keep2 <- !mismatch
+    ds$snp     <- ds$snp[keep2]
+    ds$beta    <- ds$beta[keep2]
+    ds$varbeta <- ds$varbeta[keep2]
+    ds$MAF     <- ds$MAF[keep2]
+    ds$A1      <- ds$A1[keep2]
+    ds$A2      <- ds$A2[keep2]
+    ds$REF     <- ds$REF[keep2]
+    ds$ALT     <- ds$ALT[keep2]
+    if (!is.null(ds$pos)) ds$pos <- ds$pos[keep2]
+    idx <- idx[keep][keep2]
+  } else {
+    idx <- idx[keep]
+  }
+
+  # subset LD matrix
+  ds$LD <- R_all[idx, idx]
+
+  message(trait_label, ": attached LD for ", length(ds$snp), " SNPs")
+
+  ds
+}
+
+runsusie_cc <- function(ds, L = 10, maxit = 10000) {
+  z <- ds$beta / sqrt(ds$varbeta)
+
+  susie_fit <- susie_rss(
+    z        = z,
+    R        = ds$LD,
+    n        = ds$N,
+    L        = L,
+    coverage = 0.95,
+    max_iter = maxit
+  )
+
+  susie_fit$snp <- ds$snp
+  if (!is.null(ds$pos)) susie_fit$pos <- ds$pos
+  susie_fit$label <- ds$label
+  susie_fit
+}
+
+
+datasets$PD  <- attach_ld_cc(datasets$PD,  "PD")
+datasets$MSA <- attach_ld_cc(datasets$MSA, "MSA")
+datasets$AD  <- attach_ld_cc(datasets$AD,  "AD")
+datasets$CJD <- attach_ld_cc(datasets$CJD, "CJD")
+datasets$FTD <- attach_ld_cc(datasets$FTD, "FTD")
+
+susie_ALS <- runsusie_cc(dataset.als)
+susie_PSP <- runsusie_cc(dataset.psp)
+susie_PD  <- runsusie_cc(datasets$PD)
+susie_MSA <- runsusie_cc(datasets$MSA)
+susie_AD  <- runsusie_cc(datasets$AD)
+susie_CJD <- runsusie_cc(datasets$CJD)
+susie_FTD <- runsusie_cc(datasets$FTD)
+
+
+```
+
+```{r}
+library(dplyr)
+
+summarise_cs <- function(susie_fit, gwas_df, trait_label) {
+  # SNP-level table: SNP, pos, P, pip, cs_id (NA if not in any CS)
+  pip_tbl <- data.frame(
+    SNP = susie_fit$snp,
+    pip = susie_fit$pip,
+    stringsAsFactors = FALSE
+  )
+  
+  cs_list <- susie_fit$sets$cs
+  
+  if (is.null(cs_list)) {
+    warning(trait_label, ": no credible sets found by SuSiE.")
+    return(list(
+      snp_level = NULL,
+      cs_level  = NULL
+    ))
+  }
+  
+  cs_tbl <- lapply(seq_along(cs_list), function(i) {
+    snp_idx <- cs_list[[i]]
+    data.frame(
+      SNP   = susie_fit$snp[snp_idx],
+      cs_id = paste0("CS", i),
+      stringsAsFactors = FALSE
+    )
+  }) %>% bind_rows()
+  
+  snp_level <- pip_tbl %>%
+    left_join(cs_tbl, by = "SNP") %>%
+    left_join(gwas_df %>% select(SNP, pos, P), by = "SNP") %>%
+    mutate(trait = trait_label)
+  
+  cs_level <- snp_level %>%
+    filter(!is.na(cs_id)) %>%
+    group_by(trait, cs_id) %>%
+    summarise(
+      n_snps   = n(),
+      lead_SNP = SNP[which.max(pip)],
+      max_pip  = max(pip, na.rm = TRUE),
+      min_pos  = min(pos, na.rm = TRUE),
+      max_pos  = max(pos, na.rm = TRUE),
+      .groups  = "drop"
+    ) %>%
+    mutate(span_kb = (max_pos - min_pos) / 1e3)
+  
+  list(
+    snp_level = snp_level,
+    cs_level  = cs_level
+  )
+}
+
+psp_cs  <- summarise_cs(susie_PSP, PSP_f, "PSP")
+als_cs  <- summarise_cs(susie_ALS, ALS_f, "ALS")
+ftd_cs  <- summarise_cs(susie_FTD, FTD_h, "FTD")
+ad_cs  <- summarise_cs(susie_AD, AD_h, "AD")
+msa_cs <- summarise_cs(susie_MSA, MSA_h, "MSA")
+pd_cs <- summarise_cs(susie_PD, PD_h, "PD")
+cjd_cs <- summarise_cs(susie_CJD, CJD_f, "CJD")
+
+psp_cs$cs_level
+als_cs$cs_level
+ftd_cs$cs_level
+
+
+cs_all <- bind_rows(
+  psp_cs$cs_level,
+  als_cs$cs_level,
+  ftd_cs$cs_level
+)
+
+cs_all
+
+```
+```{r}
+library(ggplot2)
+library(ggrepel)
+
+plot_cs_manhattan <- function(cs_obj, trait_label, title_prefix = NULL) {
+  
+  snps <- cs_obj$snp_level
+  
+  # credible set colour palette
+  cs_ids <- sort(unique(na.omit(snps$cs_id)))
+  n_cs <- length(cs_ids)
+  
+  cs_cols <- if (n_cs > 0) {
+    setNames(RColorBrewer::brewer.pal(max(3, n_cs), "Set1")[1:n_cs], cs_ids)
+  } else character(0)
+  
+  col_vec <- c("not_CS" = "grey80", cs_cols)
+  
+  snps$cs_id_plot <- ifelse(is.na(snps$cs_id), "not_CS", snps$cs_id)
+  snps$neglogP <- -log10(snps$P)
+  
+  # top SNP labels (max pip per CS)
+  top_snps <- snps %>%
+    group_by(cs_id) %>%
+    filter(pip == max(pip)) %>%
+    ungroup() %>%
+    filter(!is.na(cs_id))
+  
+  p <- ggplot(snps, aes(x = pos, y = neglogP)) +
+    geom_point(aes(colour = cs_id_plot, size = pip), alpha = 0.9) +
+    scale_colour_manual(values = col_vec, name = "Credible set") +
+    scale_size(range = c(1.2, 4), name = "PIP") +
+    geom_text_repel(
+      data = top_snps,
+      aes(label = SNP),
+      size = 3,
+      min.segment.length = 0
+    ) +
+    theme_classic(base_size = 14) +
+    labs(
+      title = paste0(title_prefix, trait_label, " fine-mapping (SuSiE)"),
+      x = "Genomic position (chr 3, MOBP locus)",
+      y = expression(-log[10](P))
+    )
+  
+  p
+}
+p_psp <- plot_cs_manhattan(psp_cs, "PSP", "Credible sets: ")
+p_als <- plot_cs_manhattan(als_cs, "ALS", "Credible sets: ")
+p_ftd <- plot_cs_manhattan(ftd_cs, "FTD", "Credible sets: ")
+
+```
+
+```{r}
+plot_pip_track <- function(cs_obj, trait_label) {
+  snps <- cs_obj$snp_level
+  snps$cs_id_plot <- ifelse(is.na(snps$cs_id), "not_CS", snps$cs_id)
+  cs_ids <- sort(unique(na.omit(snps$cs_id)))
+  n_cs <- length(cs_ids)
+  
+  cs_cols <- if (n_cs > 0) {
+    setNames(RColorBrewer::brewer.pal(max(3, n_cs), "Set1")[1:n_cs], cs_ids)
+  } else character(0)
+  col_vec <- c("not_CS" = "grey80", cs_cols)
+  
+  ggplot(snps, aes(x = pos, y = pip, colour = cs_id_plot)) +
+    geom_point(size = 2, alpha = 0.9) +
+    scale_colour_manual(values = col_vec, name = "Credible set") +
+    theme_classic(base_size = 14) +
+    labs(
+      title = paste(trait_label, "posterior inclusion probabilities"),
+      x = "Genomic position",
+      y = "PIP"
+    )
+}
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+
+
+plot_pip_with_labels <- function(cs_obj, disease_label,
+                                 top_n_per_cs = 3,
+                                 min_pip = 0.01) {
+  # cs_obj is the list from summarise_cs()
+  snps <- cs_obj$snp_level %>%
+    mutate(
+      cs  = ifelse(is.na(cs_id), "not_CS", cs_id),
+      PIP = pip
+    )
+  
+  # label only top K SNPs per CS with PIP >= min_pip
+  lab_df <- snps %>%
+    filter(cs != "not_CS", PIP >= min_pip) %>%
+    group_by(cs) %>%
+    slice_max(order_by = PIP,
+              n = top_n_per_cs,
+              with_ties = FALSE) %>%
+    ungroup()
+  
+  ggplot(snps, aes(x = pos, y = PIP, colour = cs)) +
+    geom_point(alpha = 0.9, size = 2) +
+    geom_text_repel(
+      data = lab_df,
+      aes(label = SNP),
+      size = 3,
+      box.padding = 0.3,
+      point.padding = 0.1,
+      min.segment.length = 0,
+      max.overlaps = Inf,
+      colour = "black"
+    ) +
+    scale_colour_manual(
+      values = c(
+        "CS1"    = "#d62728",
+        "CS2"    = "#1f77b4",
+        "CS3"    = "#2ca02c",
+        "not_CS" = "grey75"
+      ),
+      name = "Credible set"
+    ) +
+    theme_classic(base_size = 13) +
+    labs(
+      title = paste(disease_label, "posterior inclusion probabilities"),
+      x = "Genomic position (chr3, MOBP locus)",
+      y = "PIP"
+    )
+}
+
+p_pip_psp <- plot_pip_with_labels(psp_cs, "PSP")
+p_pip_als <- plot_pip_with_labels(als_cs, "ALS")
+p_pip_ftd <- plot_pip_with_labels(ftd_cs, "FTD")
+
+library(patchwork)
+
+p_pip_psp + p_pip_als + p_pip_ftd +
+  plot_layout(ncol = 1)
+
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+# vectors from your SuSiE summaries
+# psp_cs1, als_cs1, ftd_cs1 already defined
+
+all_cs_snps <- tibble(SNP = unique(c(psp_cs1, als_cs1, ftd_cs1)))
+
+# presence/absence for each disease
+cs_membership <- all_cs_snps %>%
+  mutate(
+    PSP = SNP %in% psp_cs1,
+    ALS = SNP %in% als_cs1,
+    FTD = SNP %in% ftd_cs1
+  )
+cs_membership
+
+```
+
+```{r}
+library(dplyr)
+library(GenomicRanges)
+library(ggplot2)
+
+## 1. Subset GENCODE to MOBP ----
+mobp_gff <- gencode_gff %>%
+  filter(gene_name == "MOBP")
+
+# Check chromosome & strand if you like:
+unique(mobp_gff$seqid)
+unique(mobp_gff$strand)
+
+## 2. Get all exons for MOBP and merge overlaps ----
+mobp_exons_raw <- mobp_gff %>%
+  filter(type == "exon") %>%
+  select(seqid, start, end, strand)
+
+# Convert to GRanges and reduce to merged exonic intervals
+gr_exons <- GRanges(
+  seqnames = mobp_exons_raw$seqid,
+  ranges   = IRanges(start = mobp_exons_raw$start,
+                     end   = mobp_exons_raw$end)
+)
+
+gr_exons_merged <- reduce(gr_exons)
+mobp_exons_merged <- as.data.frame(gr_exons_merged) %>%
+  rename(seqid = seqnames) %>%
+  select(seqid, start, end)
+
+## 3. Define gene span (for backbone / introns) ----
+gene_start <- min(mobp_exons_merged$start)
+gene_end   <- max(mobp_exons_merged$end)
+
+## 4. Plot a single MOBP strip (consensus exons) ----
+ggplot() +
+  # gene backbone = intron line
+  geom_segment(
+    aes(x = gene_start, xend = gene_end, y = 0, yend = 0),
+    linewidth = 0.6,
+    colour = "grey40"
+  ) +
+  # merged exons as boxes on the backbone
+  geom_rect(
+    data = mobp_exons_merged,
+    aes(xmin = start, xmax = end,
+        ymin = -0.1, ymax = 0.1),
+    fill = "grey20"
+  ) +
+  coord_cartesian(
+    xlim = c(gene_start - 2000, gene_end + 2000),  # add a bit of padding
+    ylim = c(-0.3, 0.3),
+    expand = FALSE
+  ) +
+  theme_classic(base_size = 12) +
+  labs(
+    x = "Genomic position on chr3",
+    y = NULL,
+    title = "MOBP gene structure (merged exons across transcripts)"
+  ) +
+  theme(
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+```
+```{r}
+library(dplyr)
+library(GenomicRanges)
+library(ggplot2)
+
+# Extract MOBP exons from GENCODE GFF
+mobp_exons <- gencode_gff %>%
+  filter(gene_name == "MOBP", type == "exon")
+
+# Merge overlapping exons
+gr <- GRanges(
+  seqnames = mobp_exons$seqid,
+  ranges   = IRanges(start = mobp_exons$start, end = mobp_exons$end)
+)
+
+gr_merged <- reduce(gr)
+
+mobp_exons_merged <- as.data.frame(gr_merged) %>%
+  transmute(start = start, end = end)
+
+# Determine gene boundaries
+gene_start <- min(mobp_exons_merged$start)
+gene_end   <- max(mobp_exons_merged$end)
+
+# Build the figure
+p_strip <- ggplot() +
+  # intron backbone
+  geom_segment(aes(x = gene_start, xend = gene_end, y = 0, yend = 0),
+               linewidth = 0.6, colour = "grey40") +
+  # exons (merged)
+  geom_rect(data = mobp_exons_merged,
+            aes(xmin = start, xmax = end, ymin = -0.1, ymax = 0.1),
+            fill = "grey20") +
+  coord_cartesian(
+    xlim = c(gene_start - 2000, gene_end + 2000),
+    ylim = c(-0.3, 0.3),
+    expand = FALSE
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  labs(
+    x = "Genomic position (chr3)",
+    title = "MOBP gene structure (merged exons)"
+  )
+
+p_strip
+
+```
+
+```{r}
+library(dplyr)
+
+## CS1 SNP sets from your SuSiE summaries
+psp_cs1 <- psp_cs$snp_level %>%
+  filter(cs_id == "CS1") %>%
+  pull(SNP) %>%
+  unique()
+
+als_cs1 <- als_cs$snp_level %>%
+  filter(cs_id == "CS1") %>%
+  pull(SNP) %>%
+  unique()
+
+ftd_cs1 <- ftd_cs$snp_level %>%
+  filter(cs_id == "CS1") %>%
+  pull(SNP) %>%
+  unique()
+
+# Combine all SNPs
+all_cs_snps <- tibble(SNP = unique(c(psp_cs1, als_cs1, ftd_cs1)))
+
+# Presence/absence by disease
+cs_membership <- all_cs_snps %>%
+  mutate(
+    PSP = SNP %in% psp_cs1,
+    ALS = SNP %in% als_cs1,
+    FTD = SNP %in% ftd_cs1
+  )
+
+# Get positions from harmonised GWAS tables
+pos_lookup <- bind_rows(
+  ALS_f %>% select(SNP, pos),
+  PSP_f %>% select(SNP, pos),
+  FTD_h %>% select(SNP, pos)
+) %>%
+  distinct(SNP, .keep_all = TRUE)
+
+cs_snps_pos <- cs_membership %>%
+  left_join(pos_lookup, by = "SNP")
+
+# Group for colouring (shared vs unique)
+cs_snps_pos <- cs_snps_pos %>%
+  mutate(
+    group = case_when(
+      PSP & ALS & !FTD ~ "Shared PSP+ALS",
+      ALS & !PSP & !FTD ~ "ALS only",
+      PSP & !ALS & !FTD ~ "PSP only",
+      FTD & !PSP & !ALS ~ "FTD only",
+      TRUE              ~ "Other"
+    )
+  )
+
+gene_start <- min(mobp_exons_merged$start)
+gene_end   <- max(mobp_exons_merged$end)
+mobp_exons_merged  # from the code that made your strip
+
+library(ggplot2)
+# optional if you want labels that don't crash into each other
+library(ggrepel)
+
+# choose y-position for SNPs above the gene line
+snp_y <- 0.25
+
+min_pos <- min(cs_snps_pos$pos, na.rm = TRUE)
+
+left_lim  <- min(min_pos, gene_start) - 2000   # include upstream FTD
+right_lim <- gene_end + 2000                  # always keep full gene
+
+p_mobp_cs <- ggplot() +
+  # intron backbone
+  geom_segment(
+    aes(x = gene_start, xend = gene_end, y = 0, yend = 0),
+    linewidth = 0.6,
+    colour = "grey40"
+  ) +
+  # exons
+  geom_rect(
+    data = mobp_exons_merged,
+    aes(xmin = start, xmax = end, ymin = -0.1, ymax = 0.1),
+    fill = "grey20"
+  ) +
+  # SNP stems
+  geom_segment(
+    data = cs_snps_pos,
+    aes(x = pos, xend = pos, y = 0, yend = 0.25, colour = group),
+    linewidth = 0.5
+  ) +
+  # SNP points
+  geom_point(
+    data = cs_snps_pos,
+    aes(x = pos, y = 0.25, colour = group),
+    size = 2
+  ) +
+  # labels for shared PSP+ALS
+  ggrepel::geom_text_repel(
+    data = cs_snps_pos ,
+    aes(x = pos, y = 0.25, label = SNP, colour = group),
+    nudge_y = 0.1,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Shared PSP+ALS" = "#E31A1C",
+      "ALS only"       = "#1F78B4",
+      "FTD only"       = "#33A02C"
+    ),
+    name = "CS1 membership"
+  ) +
+  coord_cartesian(
+    xlim = c(left_lim, right_lim),
+    ylim = c(-0.3, 0.5),
+    expand = FALSE
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title.y  = element_blank(),
+    axis.text.y   = element_blank(),
+    axis.ticks.y  = element_blank()
+  ) +
+  labs(
+    x = "Genomic position (chr3)",
+    title = "CS1 credible SNPs across MOBP locus"
+  )
+
+p_mobp_cs
+
+
+```
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# --- Extract CS1 SNP lists ---
+
+
+# --- Combine all unique CS1 SNPs ---
+all_cs1_snps <- union(union(psp_cs_snps, als_cs1), ftd_cs1)
+
+# --- Build membership columns ---
+summary_tbl <- tibble(SNP = all_cs1_snps) %>%
+  mutate(
+    PSP = ifelse(SNP %in% psp_cs1, "✓", ""),
+    ALS = ifelse(SNP %in% als_cs1, "✓", ""),
+    FTD = ifelse(SNP %in% ftd_cs1, "✓", "")
+  )
+
+# --- Add group label ---
+summary_tbl <- summary_tbl %>%
+  mutate(
+    Group = case_when(
+      PSP == "✓" & ALS == "✓" ~ "Shared PSP+ALS",
+      ALS == "✓" & PSP == ""  ~ "ALS only",
+      FTD == "✓"              ~ "FTD only",
+      TRUE                    ~ "Other"
+    )
+  )
+
+# --- Extract PIP values from CS results ---
+get_pip_df <- function(cs_obj, label){
+  cs_obj %>% 
+    select(SNP, PIP) %>% 
+    rename(!!paste0(label, "_PIP") := PIP)
+}
+
+pip_psp <- get_pip_df(psp_cs, "PSP")
+pip_als <- get_pip_df(als_cs, "ALS")
+pip_ftd <- get_pip_df(ftd_cs, "FTD")
+
+# --- Merge PIP values into table ---
+summary_tbl <- summary_tbl %>%
+  left_join(pip_psp, by = "SNP") %>%
+  left_join(pip_als, by = "SNP") %>%
+  left_join(pip_ftd, by = "SNP")
+
+# --- Arrange for clean viewing ---
+summary_tbl <- summary_tbl %>%
+  arrange(desc(Group), SNP)
+
+summary_tbl
+
+```
+
+```{r}
+library(dplyr)
+
+## 1) Extract CS1 SNPs + PIPs from each disease ----
+
+psp_cs1_df <- psp_cs$snp_level %>%
+  filter(cs_id == "CS1") %>%
+  transmute(
+    SNP,
+    pos,
+    PSP_PIP = pip,
+    PSP_CS1 = TRUE
+  )
+
+als_cs1_df <- als_cs$snp_level %>%
+  filter(cs_id == "CS1") %>%
+  transmute(
+    SNP,
+    pos,
+    ALS_PIP = pip,
+    ALS_CS1 = TRUE
+  )
+
+ftd_cs1_df <- ftd_cs$snp_level %>%
+  filter(cs_id == "CS1") %>%
+  transmute(
+    SNP,
+    pos,
+    FTD_PIP = pip,
+    FTD_CS1 = TRUE
+  )
+## 2) Full join on SNP + pos to unify all CS1 SNPs ----
+
+cs1_summary <- psp_cs1_df %>%
+  full_join(als_cs1_df, by = c("SNP", "pos")) %>%
+  full_join(ftd_cs1_df, by = c("SNP", "pos"))
+
+## 3) Replace NA flags with FALSE, PIPs with 0 if missing ----
+
+cs1_summary <- cs1_summary %>%
+  mutate(
+    PSP_CS1 = if_else(is.na(PSP_CS1), FALSE, PSP_CS1),
+    ALS_CS1 = if_else(is.na(ALS_CS1), FALSE, ALS_CS1),
+    FTD_CS1 = if_else(is.na(FTD_CS1), FALSE, FTD_CS1),
+    PSP_PIP = if_else(is.na(PSP_PIP), 0, PSP_PIP),
+    ALS_PIP = if_else(is.na(ALS_PIP), 0, ALS_PIP),
+    FTD_PIP = if_else(is.na(FTD_PIP), 0, FTD_PIP)
+  )
+
+## 4) Add a simple group label & pretty ticks ----
+
+cs1_summary <- cs1_summary %>%
+  mutate(
+    Group = case_when(
+      PSP_CS1 & ALS_CS1 & !FTD_CS1 ~ "Shared PSP+ALS",
+      ALS_CS1 & !PSP_CS1 & !FTD_CS1 ~ "ALS only",
+      FTD_CS1 & !PSP_CS1 & !ALS_CS1 ~ "FTD only",
+      TRUE                          ~ "Other"
+    ),
+    PSP = if_else(PSP_CS1, "✓", ""),
+    ALS = if_else(ALS_CS1, "✓", ""),
+    FTD = if_else(FTD_CS1, "✓", "")
+  ) %>%
+  select(
+    SNP, pos,
+    PSP, ALS, FTD,
+    PSP_PIP, ALS_PIP, FTD_PIP,
+    Group
+  ) %>%
+  arrange(Group, SNP)
+
+cs1_summary
+
+```
+

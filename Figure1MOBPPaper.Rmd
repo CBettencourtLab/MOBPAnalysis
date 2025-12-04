@@ -1,0 +1,1170 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+AD <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/Bellenguez_MOBP.tsv", header = T)
+CJD <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/Jones_MOBP.tsv", header = T)
+MSA <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/MSAFull.tsv", header = T)
+MSA <- subset(MSA, chromosome == "3")
+MSA <- subset(MSA, rs_id %in% PSP_f$SNP)
+PD <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/Nalls_MOBP.tsv", header = T)
+FTD <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/Manzoni_FTD._chr3_window.tsv", header = T)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+library(dplyr)
+
+ref_panel_rs <- ALS_f %>%
+  transmute(
+    SNP   = SNP,   # rsID
+    chr   = as.numeric(chr),
+    pos   = as.numeric(pos),
+    REF_ref = REF,
+    ALT_ref = ALT,
+    MAF_ref = MAF
+  )
+
+ALS_raw <- ALS_f %>%
+  transmute(
+    chr,
+    pos,
+    SNP,
+    A1_raw = A1,
+    A2_raw = A2,
+    beta   = log(OR),
+    SE,
+    P
+  )
+
+PSP_raw <- PSP_f %>%
+  transmute(
+    chr,
+    pos,
+    SNP,
+    A1_raw = A1,
+    A2_raw = A2,
+    beta   = log(OR),
+    SE,
+    P
+  )
+
+PD_raw <- PD %>%
+  transmute(
+    chr  = CHR,
+    pos  = POS,
+    SNP  = RSID,
+    A1_raw = A1,    # effect allele
+    A2_raw = A2,    # other allele
+    beta   = beta,
+    SE     = se,
+    P      = p
+  )
+AD_raw <- AD %>%
+  filter(!grepl("MARKER_ID", MARKER_ID)) %>%  # drop extra header row
+  transmute(
+    chr  = chr,
+    pos  = pos,
+    SNP  = RSID,
+    A1_raw = Allele1,   # effect allele
+    A2_raw = Allele2,   # other
+    beta   = Effect,
+    SE     = StdErr,
+    P      = PVALUE
+  )
+# from your latest head(MSA):
+# chromosome base_pair_location effect_allele other_allele ... beta rs_id ...
+
+MSA_raw <- MSA %>%
+  transmute(
+    chr  = chromosome,
+    pos  = base_pair_location,
+    SNP  = rs_id,
+    A1_raw = effect_allele,   # effect allele
+    A2_raw = other_allele,    # other allele
+    beta   = beta,
+    SE     = standard_error,
+    P      = p_value
+  )
+FTD_raw <- FTD %>%
+  separate(SNP, into = c("chr_s", "pos_s", "ref", "alt"),
+           sep = ":", remove = FALSE) %>%
+  mutate(
+    chr  = as.integer(chr_s),
+    pos  = as.integer(pos_s),
+    beta = log(OR),
+    SE   = SE,
+    P    = PVALUE,
+    A1_raw = A1,
+    A2_raw = case_when(
+      A1_raw == ref ~ alt,
+      A1_raw == alt ~ ref,
+      TRUE          ~ NA_character_
+    ),
+    SNP = NA_character_  # no rsID here; optional
+  ) %>%
+  select(chr, pos, SNP, A1_raw, A2_raw, beta, SE, P)
+CJD_raw <- CJD %>%
+  transmute(
+    chr  = chromosome,
+    pos  = base_pair_location,
+    SNP  = variant_id,
+    A1_raw = effect_allele,
+    A2_raw = other_allele,
+    beta   = beta,
+    SE     = standard_error,
+    P      = p_value
+  )
+
+```
+
+```{r}
+harmonise_to_als <- function(df_raw, ref_panel, name = "trait") {
+  # Clean and coerce types in the disease dataset
+  df2 <- df_raw %>%
+    mutate(
+      chr     = as.numeric(gsub("^chr", "", chr)),  # handles "3" or "chr3"
+      pos     = as.numeric(pos),
+      beta    = as.numeric(beta),
+      SE      = as.numeric(SE),
+      A1_raw  = as.character(A1_raw),
+      A2_raw  = as.character(A2_raw)
+    )
+
+  # Coerce types in reference too
+  ref2 <- ref_panel %>%
+    mutate(
+      chr = as.numeric(chr),
+      pos = as.numeric(pos)
+    )
+
+  # Join on chr + pos
+  merged <- df2 %>%
+    inner_join(ref2, by = c("chr", "pos"))
+
+  # How do alleles relate to ALS REF/ALT?
+  same <- merged$A1_raw == merged$ALT_ref & merged$A2_raw == merged$REF_ref
+  flip <- merged$A1_raw == merged$REF_ref & merged$A2_raw == merged$ALT_ref
+
+  # Guard against NAs in same/flip
+  ok <- (same | flip) & !is.na(same) & !is.na(flip)
+  if (!all(ok)) {
+    message(name, ": dropping ", sum(!ok), " SNPs with incompatible alleles.")
+    merged <- merged[ok, , drop = FALSE]
+    flip   <- flip[ok]
+  }
+
+  # Make absolutely sure beta is numeric before flipping
+  merged$beta <- as.numeric(merged$beta)
+  merged$beta[flip] <- -merged$beta[flip]
+
+  # Final harmonised output: ALS orientation + ALS MAF
+  out <- merged %>%
+    mutate(
+      SNP = SNP_ref,
+      A1  = ALT_ref,
+      A2  = REF_ref,
+      REF = REF_ref,
+      ALT = ALT_ref,
+      MAF = MAF_ref
+    ) %>%
+    select(chr, pos, SNP, A1, A2, beta, SE, P, MAF, REF, ALT)
+
+  out
+}
+
+
+ALS_h <- harmonise_to_als(ALS_raw, ref_panel, "ALS")
+PSP_h <- harmonise_to_als(PSP_raw, ref_panel, "PSP")
+PD_h  <- harmonise_to_als(PD_raw,  ref_panel, "PD")
+AD_h  <- harmonise_to_als(AD_raw,  ref_panel, "AD")
+MSA_h <- harmonise_to_als(MSA_raw, ref_panel, "MSA")
+FTD_h <- harmonise_to_als(FTD_raw, ref_panel, "FTD")
+CJD_h <- harmonise_to_als(CJD_raw, ref_panel, "CJD")
+
+```
+
+```{r}
+ref_panel <- ALS_f %>%
+  transmute(
+    SNP = as.character(SNP),
+    REF_ref = REF,
+    ALT_ref = ALT,
+    MAF_ref = MAF
+  )
+```
+
+
+```{r}
+ALS_raw <- ALS_f %>%
+  transmute(
+    SNP = as.character(SNP),
+    A1_raw = A1,
+    A2_raw = A2,
+    beta = log(OR),
+    SE,
+    P
+  )
+
+PSP_raw <- PSP_f %>%
+  transmute(
+    SNP = as.character(SNP),
+    A1_raw = A1,
+    A2_raw = A2,
+    beta = log(OR),
+    SE,
+    P
+  )
+
+PD_raw <- PD %>%
+  transmute(
+    SNP = as.character(RSID),
+    A1_raw = A1,
+    A2_raw = A2,
+    beta = beta,
+    SE = se,
+    P = p
+  )
+
+AD_raw <- AD %>%
+  filter(!grepl("MARKER_ID", MARKER_ID)) %>%     # remove duplicated header row
+  mutate(
+    chr = as.numeric(chr),
+    pos = as.numeric(pos),
+    beta = as.numeric(Effect),
+    SE   = as.numeric(StdErr),
+    P    = as.numeric(PVALUE),
+    SNP  = as.character(RSID),
+    A1_raw = as.character(Allele1),
+    A2_raw = as.character(Allele2)
+  ) %>%
+  filter(!is.na(SNP)) %>%                        # remove the <NA> SNP rows
+  select(SNP, chr, pos, A1_raw, A2_raw, beta, SE, P)
+
+
+MSA_raw <- MSA %>%
+  transmute(
+    SNP = as.character(rs_id),
+    A1_raw = effect_allele,
+    A2_raw = other_allele,
+    beta = beta,
+    SE = standard_error,
+    P = p_value
+  )
+CJD_raw <- CJD %>%
+  transmute(
+    SNP = as.character(variant_id),
+    A1_raw = effect_allele,
+    A2_raw = other_allele,
+    beta = beta,
+    SE = standard_error,
+    P = p_value
+  )
+
+
+```
+
+```{r}
+
+harmonise_by_snp <- function(df_raw, ref_panel, trait = "trait") {
+
+  df2 <- df_raw %>%
+    mutate(
+      SNP    = as.character(SNP),
+      A1_raw = as.character(A1_raw),
+      A2_raw = as.character(A2_raw),
+      beta   = as.numeric(beta),
+      SE     = as.numeric(SE),
+      P      = as.numeric(P)
+    )
+
+  ref2 <- ref_panel %>%
+    mutate(
+      SNP    = as.character(SNP),
+      REF_ref = as.character(REF_ref),
+      ALT_ref = as.character(ALT_ref)
+    )
+
+  merged <- df2 %>% inner_join(ref2, by = "SNP")
+
+  if (nrow(merged) == 0) {
+    warning(trait, ": no overlapping SNPs with ALS by rsID.")
+    return(NULL)
+  }
+
+  # allele matching
+  same <- merged$A1_raw == merged$ALT_ref & merged$A2_raw == merged$REF_ref
+  flip <- merged$A1_raw == merged$REF_ref & merged$A2_raw == merged$ALT_ref
+
+  ok <- (same | flip) & !is.na(same) & !is.na(flip)
+
+  if (!all(ok)) {
+    message(trait, ": dropping ", sum(!ok), " SNPs with incompatible alleles.")
+    merged <- merged[ok, , drop = FALSE]
+    flip   <- flip[ok]
+  }
+
+  merged$beta <- as.numeric(merged$beta)
+  merged$beta[flip] <- -merged$beta[flip]
+
+  merged %>%
+    transmute(
+      chr = chr,            # <— no suffix needed
+      pos = pos,
+      SNP,
+      A1  = ALT_ref,        # effect allele = ALS ALT
+      A2  = REF_ref,
+      beta,
+      SE,
+      P,
+      MAF = MAF_ref,        # use ALS MAF
+      REF = REF_ref,
+      ALT = ALT_ref
+    )
+}
+
+harmonise_simple <- function(df_raw, ref_panel, name="TRAIT") {
+  
+  merged <- df_raw %>%
+    inner_join(ref_panel, by="SNP")
+  
+  if (nrow(merged) == 0) {
+    stop(name, ": no overlapping SNPs with ALS.")
+  }
+  
+  # compatibility: same orientation
+  same <- merged$A1_raw == merged$ALT_ref & merged$A2_raw == merged$REF_ref
+  
+  # reversed orientation → flip beta
+  flip <- merged$A1_raw == merged$REF_ref & merged$A2_raw == merged$ALT_ref
+  
+  ok <- same | flip
+  
+  if (!all(ok)) {
+    message(name, ": dropping ", sum(!ok), " incompatible SNPs.")
+    merged <- merged[ok, ]
+    flip   <- flip[ok]
+  }
+  
+  # flip beta if alleles reversed
+  merged$beta[flip] <- -merged$beta[flip]
+  
+  # output in ALS orientation with ALS MAF
+  merged %>%
+    transmute(
+      SNP,
+      A1 = ALT_ref,   # effect allele always ALS ALT
+      A2 = REF_ref,
+      beta,
+      SE,
+      P,
+      MAF = MAF_ref,
+      REF = REF_ref,
+      ALT = ALT_ref
+    )
+}
+
+ALS_h <- harmonise_simple(ALS_raw, ref_panel, "ALS")
+PSP_h <- harmonise_simple(PSP_raw, ref_panel, "PSP")
+PD_h  <- harmonise_simple(PD_raw,  ref_panel, "PD")
+AD_h <- harmonise_by_snp(AD_raw, ref_panel, "AD")
+
+MSA_h <- harmonise_simple(MSA_raw, ref_panel, "MSA")
+CJD_h <- harmonise_simple(CJD_raw, ref_panel, "CJD")
+
+```
+
+```{r}
+library(dplyr)
+library(purrr)
+
+# list of harmonised datasets
+disease_list <- list(
+  ALS = ALS_h,
+  PSP = PSP_h,
+  PD  = PD_h,
+  MSA = MSA_h,
+  AD  = AD_h,
+  CJD = CJD_h,
+  FTD = FTD_h
+)
+beta_mat <- reduce(
+  lapply(names(disease_list), function(name) {
+    disease_list[[name]] %>%
+      select(SNP, beta) %>%
+      rename(!!paste0("beta_", name) := beta)
+  }),
+  full_join,
+  by = "SNP"
+)
+p_mat <- reduce(
+  lapply(names(disease_list), function(name) {
+    disease_list[[name]] %>%
+      select(SNP, P) %>%
+      rename(!!paste0("p_", name) := P)
+  }),
+  full_join,
+  by = "SNP"
+)
+annot <- ALS_h %>% select(SNP, REF, ALT, MAF)
+
+
+full_tbl <- annot %>%
+  left_join(beta_mat, by = "SNP") %>%
+  left_join(p_mat,     by = "SNP")
+beta_only <- full_tbl %>% select(starts_with("beta_"))
+corr_mat <- cor(beta_only, use = "pairwise.complete.obs")
+corr_mat
+
+library(reshape2)
+library(ggplot2)
+
+melt_corr <- melt(corr_mat)
+
+ggplot(melt_corr, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(limits=c(-1,1)) +
+  geom_text(aes(label=sprintf("%.2f", value)), size=3, color="white") +
+  theme_minimal(base_size=14) +
+  labs(title="Cross-Disease Effect Size Correlation")
+df <- full_tbl %>% select(SNP, beta_ALS, beta_PSP) %>% drop_na()
+
+ggplot(df, aes(beta_ALS, beta_PSP)) +
+  geom_point(alpha=0.7) +
+  geom_smooth(method="lm", se=FALSE, color="red") +
+  theme_classic(base_size=14) +
+  labs(title="ALS vs PSP SNP Effect Sizes")
+
+library(pheatmap)
+
+heat_df <- full_tbl %>%
+  select(starts_with("beta_")) %>%
+  as.matrix()
+
+rownames(heat_df) <- full_tbl$SNP
+
+pheatmap(heat_df, scale="row")
+
+
+```
+```{r}
+pval_mat <- full_tbl %>%
+  select(starts_with("p_")) %>%
+  mutate(across(everything(), ~ -log10(.)))
+
+pval_mat <- full_tbl %>%
+  select(starts_with("p_")) %>%
+  mutate(across(everything(), ~ -log10(pmax(., 1e-300))))
+
+pval_corr <- cor(pval_mat, use = "pairwise.complete.obs")
+pval_corr
+
+library(reshape2)
+library(ggplot2)
+
+melt_corr <- melt(pval_corr)
+
+ggplot(melt_corr, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "grey90", size = 0.3) +
+  scale_fill_gradient2(
+    low = "#4575b4",
+    mid = "white",
+    high = "#d73027",
+    midpoint = 0,
+    limits = c(-1,1),
+    name = "Correlation"
+  ) +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3.5) +
+  theme_minimal(base_size = 15) +
+  labs(title = "-log10(P) Correlation Across Diseases") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+```
+```{r}
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+
+# Convert P-values to -log10 scale (with floor to avoid Inf)
+p_mat <- full_tbl %>%
+  select(starts_with("p_")) %>%
+  mutate(across(everything(), ~ -log10(pmax(., 1e-300))))
+
+
+p_corr <- cor(p_mat, use = "pairwise.complete.obs")
+p_corr_melt <- melt(p_corr)
+ggplot(p_corr_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "grey90", size = 0.3) +
+  scale_fill_gradient2(
+    low = "#2166ac",   # blue
+    mid = "white",
+    high = "#b2182b",  # dark red
+    midpoint = 0,
+    limits = c(-1,1),
+    name = "Correlation"
+  ) +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 4, fontface="bold") +
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "P-value Correlation Across Neurodegenerative Diseases",
+    x = "", y = ""
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+beta_mat <- full_tbl %>%
+  select(starts_with("beta_"))
+beta_corr <- cor(beta_mat, use = "pairwise.complete.obs")
+beta_corr_melt <- melt(beta_corr)
+ggplot(beta_corr_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "grey90", size = 0.3) +
+  scale_fill_gradient2(
+    low = "#2166ac",
+    mid = "white",
+    high = "#b2182b",
+    midpoint = 0,
+    limits = c(-1,1),
+    name = "Correlation"
+  ) +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 4, fontface="bold") +
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "Effect Size Correlation Across Neurodegenerative Diseases",
+    x = "", y = ""
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(pheatmap)
+library(patchwork)
+
+```
+
+```{r}
+# convert P → –log10(P)
+p_mat <- full_tbl %>%
+  select(starts_with("p_")) %>%
+  mutate(across(everything(), ~ -log10(pmax(., 1e-300))))
+
+# correlation matrix
+p_corr <- cor(p_mat, use="pairwise.complete.obs")
+
+# distance matrix for clustering
+dist_mat <- dist(1 - p_corr)
+
+hc <- hclust(dist_mat, method="average")
+
+# Plot dendrogram
+plot(hc, main = "Disease Clustering by P-value Similarity",
+     xlab="", sub="", cex=1.2)
+
+
+p_corr_melt <- melt(p_corr)
+
+# order axes by dendrogram
+disease_order <- hc$labels[hc$order]
+p_corr_melt$Var1 <- factor(p_corr_melt$Var1, levels=disease_order)
+p_corr_melt$Var2 <- factor(p_corr_melt$Var2, levels=disease_order)
+
+pval_heatmap <- ggplot(p_corr_melt, aes(Var1, Var2, fill=value)) +
+  geom_tile(color="grey90") +
+  scale_fill_gradient2(low="#2166ac", high="#b2182b", mid="white",
+                       limits=c(-1,1), midpoint=0, name="Correlation") +
+  geom_text(aes(label=sprintf("%.2f", value)), size=4) +
+  theme_minimal(base_size=14) +
+  theme(axis.text.x = element_text(angle=45, hjust=1),
+        panel.grid = element_blank()) +
+  labs(title="P-value Correlation Across Diseases", x="", y="")
+
+
+beta_mat <- full_tbl %>%
+  select(starts_with("beta_"))
+
+beta_corr <- cor(beta_mat, use="pairwise.complete.obs")
+beta_corr_melt <- melt(beta_corr)
+
+# cluster disease order from p-values for consistency
+beta_corr_melt$Var1 <- factor(beta_corr_melt$Var1, levels=disease_order)
+beta_corr_melt$Var2 <- factor(beta_corr_melt$Var2, levels=disease_order)
+
+beta_heatmap <- ggplot(beta_corr_melt, aes(Var1, Var2, fill=value)) +
+  geom_tile(color="grey90") +
+  scale_fill_gradient2(low="#2166ac", high="#b2182b", mid="white",
+                       limits=c(-1,1), midpoint=0, name="Correlation") +
+  geom_text(aes(label=sprintf("%.2f", value)), size=4) +
+  theme_minimal(base_size=14) +
+  theme(axis.text.x = element_text(angle=45, hjust=1),
+        panel.grid = element_blank()) +
+  labs(title="Effect Size Correlation Across Diseases", x="", y="")
+
+
+snp_mat <- full_tbl %>%
+  select(SNP, starts_with("p_")) %>%
+  mutate(across(starts_with("p_"), ~ -log10(pmax(.,1e-300)))) %>%
+  column_to_rownames("SNP")
+
+# order diseases according to dendrogram
+snp_mat <- snp_mat[, paste0("p_", disease_order)]
+
+# scale rows for visual clarity
+pheatmap(snp_mat,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         show_rownames = FALSE,
+         fontsize = 10,
+         main = "SNP–Disease Heatmap (–log10(P))")
+
+library(patchwork)
+
+(pval_heatmap | beta_heatmap) +
+  plot_annotation(title = "Cross-Disease Genetic Architecture at the MOBP Locus")
+
+```
+```{r}
+ref_pos <- PSP_f %>% select(SNP, chr, pos)
+
+ALS_manhattan <- ALS_h %>%
+  left_join(ref_pos, by = "SNP") %>%
+  filter(!is.na(pos))  # remove SNPs not present in PSP_f
+PSP_manhattan  <- PSP_h  %>% left_join(ref_pos, by = "SNP")
+ALS_manhattan  <- ALS_h  %>% left_join(ref_pos, by = "SNP")
+PD_manhattan   <- PD_h   %>% left_join(ref_pos, by = "SNP")
+MSA_manhattan  <- MSA_h  %>% left_join(ref_pos, by = "SNP")
+AD_manhattan   <- AD_h   %>% left_join(ref_pos, by = "SNP")
+AD_manhattan <- AD_manhattan[,-c(12,13)]
+names(AD_manhattan)[1] <- paste("chr")
+names(AD_manhattan)[2] <- paste("pos")
+CJD_manhattan  <- CJD_h  %>% left_join(ref_pos, by = "SNP")
+FTD_manhattan  <- FTD_h  %>% left_join(ref_pos, by = "SNP")
+
+FTD_manhattan <- FTD_manhattan[,-c(12,13)]
+names(FTD_manhattan)[1] <- paste("chr")
+names(FTD_manhattan)[2] <- paste("pos")
+
+```
+
+```{r}
+plot_manhattan <- function(df, disease_name){
+  ggplot(df, aes(x = pos, y = -log10(P))) +
+    geom_point(alpha = 0.7, size = 2, color = "steelblue") +
+    theme_classic(base_size = 16) +
+    labs(
+      title = paste("Manhattan Plot —", disease_name),
+      x = "Genomic Position (chr3)",
+      y = expression(-log[10](P))
+    ) +
+    geom_hline(yintercept = -log10(5e-8),
+               linetype = "dashed", color = "red") +
+    theme(
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14)
+    )
+}
+
+```
+
+```{r}
+plot_manhattan(ALS_manhattan, "ALS")
+plot_manhattan(PSP_manhattan, "PSP")
+plot_manhattan(PD_manhattan, "PD")
+plot_manhattan(MSA_manhattan, "MSA")
+plot_manhattan(AD_manhattan, "AD")
+plot_manhattan(CJD_manhattan, "CJD")
+plot_manhattan(FTD_manhattan, "FTD")
+
+```
+```{r}
+library(coloc)
+library(dplyr)
+library(purrr)
+
+build_cc_dataset <- function(df, N, s, label) {
+  list(
+    snp     = df$SNP,
+    beta    = df$beta,
+    varbeta = df$SE^2,
+    MAF     = df$MAF,
+    N       = N,
+    s       = s,          # proportion of cases (N_cases / N)
+    type    = "cc",
+    label   = label
+  )
+}
+
+## ------------ Sample sizes from your message ------------
+
+# PSP: 2,779 cases, 5,584 controls
+N_PSP <- 2779 + 5584        # 8363
+s_PSP <- 2779 / N_PSP       # ~0.3323
+
+# FTD: 4,685 cases, 15,308 controls
+N_FTD <- 4685 + 15308       # 19993
+s_FTD <- 4685 / N_FTD       # ~0.2343
+
+# ALS: 29,612 cases, 122,656 controls
+N_ALS <- 29612 + 122656     # 152268
+s_ALS <- 29612 / N_ALS      # ~0.1945
+
+# LBD: 2,981 cases, 4,391 controls  (for later if/when you have LBD_h)
+N_LBD <- 2981 + 4391        # 7372
+s_LBD <- 2981 / N_LBD       # ~0.4044
+
+# MSA: 888 cases, 7,128 controls
+N_MSA <- 888 + 7128         # 8016
+s_MSA <- 888 / N_MSA        # ~0.1108
+
+# AD: 111,326 cases/proxy, 677,663 controls
+N_AD <- 111326 + 677663     # 788989
+s_AD <- 111326 / N_AD       # ~0.1411
+
+# CJD: 4,110 cases, 13,569 controls
+N_CJD <- 4110 + 13569       # 17679
+s_CJD <- 4110 / N_CJD       # ~0.2325
+
+# PD: 37,700 cases, 18,600 proxy, 1,400,000 controls
+PD_cases_total <- 37700 + 18600  # 56300 treated as "cases"
+N_PD <- PD_cases_total + 1400000 # 1456300
+s_PD <- PD_cases_total / N_PD    # ~0.03866
+
+```
+```{r}
+datasets <- list(
+  ALS = build_cc_dataset(ALS_h, N_ALS, s_ALS, "ALS"),
+  PSP = build_cc_dataset(PSP_h, N_PSP, s_PSP, "PSP"),
+  PD  = build_cc_dataset(PD_h,  N_PD,  s_PD,  "PD"),
+  MSA = build_cc_dataset(MSA_h, N_MSA, s_MSA, "MSA"),
+  AD  = build_cc_dataset(AD_h,  N_AD,  s_AD,  "AD"),
+  CJD = build_cc_dataset(CJD_h, N_CJD, s_CJD, "CJD"),
+  FTD = build_cc_dataset(FTD_h, N_FTD, s_FTD, "FTD")
+)
+
+## If/when you have LBD_h ready:
+# datasets$LBD <- build_cc_dataset(LBD_h, N_LBD, s_LBD, "LBD")
+trait_pairs <- combn(names(datasets), 2, simplify = FALSE)
+
+coloc_results_list <- lapply(trait_pairs, function(p) {
+  t1 <- p[[1]]
+  t2 <- p[[2]]
+  message("Running coloc: ", t1, " vs ", t2)
+
+  res <- coloc.abf(
+    dataset1 = datasets[[t1]],
+    dataset2 = datasets[[t2]],
+    p1  = 1e-4,
+    p2  = 1e-4,
+    p12 = 1e-5
+  )
+
+  summary_row <- data.frame(
+    trait1 = t1,
+    trait2 = t2,
+    nsnps  = res$summary["nsnps"],
+    PP.H0  = res$summary["PP.H0.abf"],
+    PP.H1  = res$summary["PP.H1.abf"],
+    PP.H2  = res$summary["PP.H2.abf"],
+    PP.H3  = res$summary["PP.H3.abf"],
+    PP.H4  = res$summary["PP.H4.abf"],
+    stringsAsFactors = FALSE
+  )
+
+  list(summary = summary_row, full = res)
+})
+
+coloc_summary <- bind_rows(lapply(coloc_results_list, `[[`, "summary"))
+coloc_summary
+
+```
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Make sure PP.H4 is numeric
+coloc_summary <- coloc_summary %>%
+  mutate(PP.H4 = as.numeric(PP.H4))
+
+pp_h4_mat <- coloc_summary %>%
+  select(trait1, trait2, PP.H4)
+
+ggplot(pp_h4_mat, aes(trait1, trait2, fill = PP.H4)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#f7fbff",
+    mid = "#c6dbef",
+    high = "#08306b",
+    limits = c(0, 1),
+    midpoint = 0.5,
+    name = "PP.H4"
+  ) +
+  geom_text(aes(label = sprintf("%.2f", PP.H4)), color = "black", size = 3) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Coloc PP.H4 Across Disease Pairs",
+    x = "", y = ""
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+```
+```{r}
+get_pair_res <- function(a, b, trait_pairs, coloc_results_list) {
+  idx <- which(sapply(trait_pairs, function(p) all(sort(p) == sort(c(a, b)))))
+  coloc_results_list[[idx]]$full
+}
+
+res_PSP_ALS <- get_pair_res("PSP", "ALS", trait_pairs, coloc_results_list)
+res_PSP_ALS$summary
+head(res_PSP_ALS$results)
+
+library(dplyr)
+library(ggplot2)
+
+# reference positions from PSP_f
+ref_pos <- PSP_f %>% select(SNP, pos)
+
+pair_df <- res_PSP_ALS$results %>%
+  as.data.frame() %>%
+  rename(SNP = snp) %>%
+  left_join(ref_pos, by = "SNP") %>%
+  filter(!is.na(pos))
+
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+## 1. Positions from PSP_f
+ref_pos <- PSP_f %>%
+  select(SNP, pos)
+
+## 2. Coloc results as data.frame
+coloc_psp_als <- as.data.frame(res_PSP_ALS$results) %>%
+  rename(SNP = snp) %>%
+  select(SNP, SNP.PP.H4)
+
+## 3. Join everything
+plot_df <- ref_pos %>%
+  left_join(PSP_h %>% select(SNP, P_PSP = P), by = "SNP") %>%
+  left_join(ALS_h %>% select(SNP, P_ALS = P), by = "SNP") %>%
+  left_join(coloc_psp_als, by = "SNP") %>%
+  filter(!is.na(P_PSP), !is.na(P_ALS), !is.na(SNP.PP.H4))
+
+ 
+p_psp <- ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
+  geom_point(alpha = 0.7, size = 1.8, color = "#377eb8") +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "PSP",
+    x = NULL,
+    y = expression(-log[10](P))
+  )
+
+p_als <- ggplot(plot_df, aes(x = pos, y = -log10(P_ALS))) +
+  geom_point(alpha = 0.7, size = 1.8, color = "#4daf4a") +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "ALS",
+    x = NULL,
+    y = expression(-log[10](P))
+  )
+
+p_pph4 <- ggplot(plot_df, aes(x = pos, y = SNP.PP.H4)) +
+  geom_point(alpha = 0.8, size = 1.8, color = "#e41a1c") +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "PSP–ALS coloc",
+    x = "Position on chr3",
+    y = "SNP.PP.H4"
+  ) +
+  geom_hline(yintercept = 0.01, linetype = "dashed", colour = "grey50")
+
+(p_psp / p_als / p_pph4) +
+  plot_annotation(title = "PSP vs ALS colocalisation at MOBP locus")
+ 
+
+```
+```{r}
+ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
+  geom_point(aes(color = SNP.PP.H4), alpha = 0.9, size = 2) +
+  scale_color_viridis_c(option = "plasma", trans = "sqrt",
+                        name = "SNP.PP.H4") +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "PSP Manhattan at MOBP\ncoloured by PSP–ALS SNP.PP.H4",
+    x = "Position on chr3",
+    y = expression(-log[10](P))
+  )
+
+library(dplyr)
+
+top_snps <- plot_df %>%
+  arrange(desc(SNP.PP.H4)) %>%
+  slice(1:10)
+
+library(ggplot2)
+library(ggrepel)
+
+ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
+  # all SNPs
+  geom_point(aes(color = SNP.PP.H4), alpha = 0.8, size = 2) +
+  # highlight top SNPs with bigger outline points
+  geom_point(
+    data = top_snps,
+    aes(x = pos, y = -log10(P_PSP)),
+    color = "black",
+    fill  = "yellow",
+    size  = 3,
+    shape = 21,
+    stroke = 0.6
+  ) +
+  # label top SNPs
+  geom_label_repel(
+    data = top_snps,
+    aes(x = pos, y = -log10(P_PSP), label = SNP),
+    size          = 3,
+    min.segment.length = 0,
+    box.padding   = 0.25,
+    point.padding = 0.2,
+    label.size    = 0.1,
+    label.r       = unit(0.1, "lines")
+  ) +
+  scale_color_gradient(low = "blue", high = "red",
+                     name = "SNP.PP.H4")
++
+  theme_classic(base_size = 14) +
+  labs(
+    title = "PSP −log10(P) at MOBP locus\ncoloured by PSP–ALS SNP.PP.H4",
+    x = "Position on chr3",
+    y = expression(-log[10](P))
+  )
+
+library(ggplot2)
+library(ggrepel)
+
+ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
+  
+  # All SNPs coloured by coloc posterior
+  geom_point(aes(color = SNP.PP.H4), alpha = 0.85, size = 2) +
+  
+  # Highlight top SNPs
+  geom_point(
+    data = top_snps,
+    aes(x = pos, y = -log10(P_PSP)),
+    color = "black",
+    fill  = "yellow",
+    size  = 3,
+    shape = 21,
+    stroke = 0.6
+  ) +
+  
+  # SNP labels
+  geom_label_repel(
+    data = top_snps,
+    aes(x = pos, y = -log10(P_PSP), label = SNP),
+    size = 3,
+    min.segment.length = 0,
+    box.padding = 0.25,
+    point.padding = 0.15,
+    label.size = 0.1,
+    label.r = unit(0.1, "lines")
+  ) +
+  
+  # 🔵→🔴 colour scale
+  scale_color_gradient(
+    low = "blue",
+    high = "red",
+    name = "SNP.PP.H4"
+  ) +
+  
+  theme_classic(base_size = 14) +
+  labs(
+    title = "PSP −log10(P) at MOBP locus (coloured by PSP–ALS SNP.PP.H4)",
+    x = "Position on chr3",
+    y = expression(-log[10](P))
+  )
+
+
+library(ggplot2)
+library(ggrepel)
+
+ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
+  # all SNPs, coloured by posterior but starting from light grey
+  geom_point(aes(color = SNP.PP.H4), alpha = 0.9, size = 1.6) +
+  
+  # emphasise the top SNPs with red, outlined points
+  geom_point(
+    data  = top_snps,
+    aes(x = pos, y = -log10(P_PSP)),
+    inherit.aes = FALSE,
+    shape = 21,
+    size  = 2.8,
+    stroke = 0.6,
+    fill   = "red",
+    colour = "black"
+  ) +
+  
+  # labels for top SNPs – no big boxes, just text with small nudges
+  geom_text_repel(
+    data  = top_snps,
+    aes(x = pos, y = -log10(P_PSP), label = SNP),
+    size          = 3,
+    min.segment.length = 0,
+    segment.size  = 0.25,
+    box.padding   = 0.25,
+    point.padding = 0.2,
+    label.size    = NA        # removes the rectangle box
+  ) +
+  
+  # nicer blue→red gradient (low = pale grey, mid = blue, high = red)
+  scale_color_gradientn(
+    colours = c("grey85", "royalblue3", "red3"),
+    values  = scales::rescale(c(0, 0.1, max(plot_df$SNP.PP.H4, na.rm = TRUE))),
+    name    = "SNP.PP.H4",
+    limits  = c(0, max(plot_df$SNP.PP.H4, na.rm = TRUE))
+  ) +
+  
+  theme_classic(base_size = 14) +
+  labs(
+    title = "PSP −log10(P) at MOBP locus (coloured by PSP–ALS SNP.PP.H4)",
+    x = "Position on chr3",
+    y = expression(-log[10](P))
+  ) +
+  theme(
+    legend.position = "right",
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 11),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+  )
+
+```
+```{r}
+library(dplyr)
+
+top_snps <- plot_df %>%
+  arrange(desc(SNP.PP.H4)) %>%
+  slice(1:10)   # tweak number as you like
+library(ggplot2)
+library(ggrepel)
+
+library(dplyr)
+
+top_snps <- plot_df %>%
+  arrange(desc(SNP.PP.H4)) %>%
+  slice(1:6)
+
+x_min <- min(top_snps$pos) - 1e5   # 100 kb either side
+x_max <- max(top_snps$pos) + 1e5
+
+gws_line  <- -log10(5e-8)   # genome-wide significance
+sugg_line <- -log10(1e-5)   # suggestive (optional)
+
+library(ggplot2)
+library(ggrepel)
+
+p_psp_zoom <- ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
+  geom_point(aes(color = SNP.PP.H4), alpha = 0.85, size = 1.6) +
+  geom_point(
+    data  = top_snps,
+    aes(x = pos, y = -log10(P_PSP)),
+    inherit.aes = FALSE,
+    shape = 21,
+    size  = 2.8,
+    stroke = 0.6,
+    fill   = "red",
+    colour = "black"
+  ) +
+  geom_text_repel(
+    data  = top_snps,
+    aes(x = pos, y = -log10(P_PSP), label = SNP),
+    size = 3,
+    min.segment.length = 0,
+    segment.size  = 0.25,
+    box.padding   = 0.25,
+    point.padding = 0.2,
+    label.size    = NA
+  ) +
+  scale_color_gradientn(
+    colours = c("grey85", "royalblue3", "red3"),
+    values  = scales::rescale(c(0, 0.1, max(plot_df$SNP.PP.H4, na.rm = TRUE))),
+    name    = "SNP.PP.H4",
+    limits  = c(0, max(plot_df$SNP.PP.H4, na.rm = TRUE))
+  ) +
+  # 🔹 genome-wide + suggestive lines
+  geom_hline(yintercept = gws_line,  linetype = "dashed", colour = "darkred") +
+  geom_hline(yintercept = sugg_line, linetype = "dotted", colour = "grey40") +
+  # 🔹 zoom to top region (x) and focus y on top signals
+  coord_cartesian(xlim = c(x_min, x_max),
+                  ylim = c(sugg_line - 1, max(-log10(plot_df$P_PSP), na.rm = TRUE) + 1)) +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "PSP −log10(P) at MOBP locus\n(coloured by PSP–ALS SNP.PP.H4)",
+    x = "Position on chr3 (zoomed)",
+    y = expression(-log[10](P))
+  )
+p_als_zoom <- ggplot(plot_df, aes(x = pos, y = -log10(P_ALS))) +
+  geom_point(aes(color = SNP.PP.H4), alpha = 0.85, size = 1.6) +
+  geom_point(
+    data  = top_snps,
+    aes(x = pos, y = -log10(P_ALS)),
+    inherit.aes = FALSE,
+    shape = 21,
+    size  = 2.8,
+    stroke = 0.6,
+    fill   = "red",
+    colour = "black"
+  ) +
+  geom_text_repel(
+    data  = top_snps,
+    aes(x = pos, y = -log10(P_ALS), label = SNP),
+    size = 3,
+    min.segment.length = 0,
+    segment.size  = 0.25,
+    box.padding   = 0.25,
+    point.padding = 0.2,
+    label.size    = NA
+  ) +
+  scale_color_gradientn(
+    colours = c("grey85", "royalblue3", "red3"),
+    values  = scales::rescale(c(0, 0.1, max(plot_df$SNP.PP.H4, na.rm = TRUE))),
+    name    = "SNP.PP.H4",
+    limits  = c(0, max(plot_df$SNP.PP.H4, na.rm = TRUE))
+  ) +
+  geom_hline(yintercept = gws_line,  linetype = "dashed", colour = "darkred") +
+  geom_hline(yintercept = sugg_line, linetype = "dotted", colour = "grey40") +
+  coord_cartesian(xlim = c(x_min, x_max),
+                  ylim = c(sugg_line - 1, max(-log10(plot_df$P_ALS), na.rm = TRUE) + 1)) +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "ALS −log10(P) at MOBP locus\n(coloured by PSP–ALS SNP.PP.H4)",
+    x = "Position on chr3 (zoomed)",
+    y = expression(-log[10](P))
+  )
+library(patchwork)
+
+p_psp_zoom + p_als_zoom + plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+```
+
