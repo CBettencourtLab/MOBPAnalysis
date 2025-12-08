@@ -8,13 +8,13 @@ This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute
 Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
 
 ```{r}
-AD <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/Bellenguez_MOBP.tsv", header = T)
-CJD <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/Jones_MOBP.tsv", header = T)
-MSA <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/MSAFull.tsv", header = T)
+AD <- read.table("Bellenguez_MOBP.tsv", header = T)
+CJD <- read.table("Jones_MOBP.tsv", header = T)
+MSA <- read.table("MSAFull.tsv", header = T)
 MSA <- subset(MSA, chromosome == "3")
 MSA <- subset(MSA, rs_id %in% PSP_f$SNP)
-PD <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/Nalls_MOBP.tsv", header = T)
-FTD <- read.table("\\\\rdp.arc.ucl.ac.uk/ritd-ag-project-rd01b9-mdcfe39/MOBPPaper/Manzoni_FTD._chr3_window.tsv", header = T)
+PD <- read.table("Nalls_MOBP.tsv", header = T)
+FTD <- read.table("Manzoni_FTD._chr3_window.tsv", header = T)
 ```
 
 ```{r}
@@ -69,7 +69,7 @@ PD_raw <- PD %>%
     P      = p
   )
 AD_raw <- AD %>%
-  filter(!grepl("MARKER_ID", MARKER_ID)) %>%  # drop extra header row
+  filter(!grepl("MARKER_ID", MARKER_ID)) %>%
   transmute(
     chr  = chr,
     pos  = pos,
@@ -80,8 +80,7 @@ AD_raw <- AD %>%
     SE     = StdErr,
     P      = PVALUE
   )
-# from your latest head(MSA):
-# chromosome base_pair_location effect_allele other_allele ... beta rs_id ...
+
 
 MSA_raw <- MSA %>%
   transmute(
@@ -150,11 +149,11 @@ harmonise_to_als <- function(df_raw, ref_panel, name = "trait") {
   merged <- df2 %>%
     inner_join(ref2, by = c("chr", "pos"))
 
-  # How do alleles relate to ALS REF/ALT?
+ 
   same <- merged$A1_raw == merged$ALT_ref & merged$A2_raw == merged$REF_ref
   flip <- merged$A1_raw == merged$REF_ref & merged$A2_raw == merged$ALT_ref
 
-  # Guard against NAs in same/flip
+  
   ok <- (same | flip) & !is.na(same) & !is.na(flip)
   if (!all(ok)) {
     message(name, ": dropping ", sum(!ok), " SNPs with incompatible alleles.")
@@ -162,11 +161,11 @@ harmonise_to_als <- function(df_raw, ref_panel, name = "trait") {
     flip   <- flip[ok]
   }
 
-  # Make absolutely sure beta is numeric before flipping
+  
   merged$beta <- as.numeric(merged$beta)
   merged$beta[flip] <- -merged$beta[flip]
 
-  # Final harmonised output: ALS orientation + ALS MAF
+  
   out <- merged %>%
     mutate(
       SNP = SNP_ref,
@@ -235,7 +234,7 @@ PD_raw <- PD %>%
   )
 
 AD_raw <- AD %>%
-  filter(!grepl("MARKER_ID", MARKER_ID)) %>%     # remove duplicated header row
+  filter(!grepl("MARKER_ID", MARKER_ID)) %>%    
   mutate(
     chr = as.numeric(chr),
     pos = as.numeric(pos),
@@ -246,7 +245,7 @@ AD_raw <- AD %>%
     A1_raw = as.character(Allele1),
     A2_raw = as.character(Allele2)
   ) %>%
-  filter(!is.na(SNP)) %>%                        # remove the <NA> SNP rows
+  filter(!is.na(SNP)) %>%                       
   select(SNP, chr, pos, A1_raw, A2_raw, beta, SE, P)
 
 
@@ -386,7 +385,7 @@ CJD_h <- harmonise_simple(CJD_raw, ref_panel, "CJD")
 library(dplyr)
 library(purrr)
 
-# list of harmonised datasets
+
 disease_list <- list(
   ALS = ALS_h,
   PSP = PSP_h,
@@ -496,7 +495,7 @@ library(dplyr)
 library(reshape2)
 library(ggplot2)
 
-# Convert P-values to -log10 scale (with floor to avoid Inf)
+
 p_mat <- full_tbl %>%
   select(starts_with("p_")) %>%
   mutate(across(everything(), ~ -log10(pmax(., 1e-300))))
@@ -562,12 +561,12 @@ library(patchwork)
 ```
 
 ```{r}
-# convert P → –log10(P)
+
 p_mat <- full_tbl %>%
   select(starts_with("p_")) %>%
   mutate(across(everything(), ~ -log10(pmax(., 1e-300))))
 
-# correlation matrix
+
 p_corr <- cor(p_mat, use="pairwise.complete.obs")
 
 # distance matrix for clustering
@@ -575,7 +574,7 @@ dist_mat <- dist(1 - p_corr)
 
 hc <- hclust(dist_mat, method="average")
 
-# Plot dendrogram
+
 plot(hc, main = "Disease Clustering by P-value Similarity",
      xlab="", sub="", cex=1.2)
 
@@ -604,7 +603,6 @@ beta_mat <- full_tbl %>%
 beta_corr <- cor(beta_mat, use="pairwise.complete.obs")
 beta_corr_melt <- melt(beta_corr)
 
-# cluster disease order from p-values for consistency
 beta_corr_melt$Var1 <- factor(beta_corr_melt$Var1, levels=disease_order)
 beta_corr_melt$Var2 <- factor(beta_corr_melt$Var2, levels=disease_order)
 
@@ -624,10 +622,8 @@ snp_mat <- full_tbl %>%
   mutate(across(starts_with("p_"), ~ -log10(pmax(.,1e-300)))) %>%
   column_to_rownames("SNP")
 
-# order diseases according to dendrogram
 snp_mat <- snp_mat[, paste0("p_", disease_order)]
 
-# scale rows for visual clarity
 pheatmap(snp_mat,
          cluster_rows = TRUE,
          cluster_cols = FALSE,
@@ -712,7 +708,7 @@ build_cc_dataset <- function(df, N, s, label) {
   )
 }
 
-## ------------ Sample sizes from your message ------------
+
 
 # PSP: 2,779 cases, 5,584 controls
 N_PSP <- 2779 + 5584        # 8363
@@ -759,7 +755,7 @@ datasets <- list(
   FTD = build_cc_dataset(FTD_h, N_FTD, s_FTD, "FTD")
 )
 
-## If/when you have LBD_h ready:
+
 # datasets$LBD <- build_cc_dataset(LBD_h, N_LBD, s_LBD, "LBD")
 trait_pairs <- combn(names(datasets), 2, simplify = FALSE)
 
@@ -800,7 +796,7 @@ library(dplyr)
 library(tidyr)
 library(ggplot2)
 
-# Make sure PP.H4 is numeric
+
 coloc_summary <- coloc_summary %>%
   mutate(PP.H4 = as.numeric(PP.H4))
 
@@ -855,16 +851,16 @@ library(dplyr)
 library(ggplot2)
 library(patchwork)
 
-## 1. Positions from PSP_f
+
 ref_pos <- PSP_f %>%
   select(SNP, pos)
 
-## 2. Coloc results as data.frame
+
 coloc_psp_als <- as.data.frame(res_PSP_ALS$results) %>%
   rename(SNP = snp) %>%
   select(SNP, SNP.PP.H4)
 
-## 3. Join everything
+
 plot_df <- ref_pos %>%
   left_join(PSP_h %>% select(SNP, P_PSP = P), by = "SNP") %>%
   left_join(ALS_h %>% select(SNP, P_ALS = P), by = "SNP") %>%
@@ -979,7 +975,7 @@ ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
     stroke = 0.6
   ) +
   
-  # SNP labels
+
   geom_label_repel(
     data = top_snps,
     aes(x = pos, y = -log10(P_PSP), label = SNP),
@@ -991,7 +987,7 @@ ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
     label.r = unit(0.1, "lines")
   ) +
   
-  # 🔵→🔴 colour scale
+
   scale_color_gradient(
     low = "blue",
     high = "red",
@@ -1010,10 +1006,10 @@ library(ggplot2)
 library(ggrepel)
 
 ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
-  # all SNPs, coloured by posterior but starting from light grey
+ 
   geom_point(aes(color = SNP.PP.H4), alpha = 0.9, size = 1.6) +
   
-  # emphasise the top SNPs with red, outlined points
+
   geom_point(
     data  = top_snps,
     aes(x = pos, y = -log10(P_PSP)),
@@ -1025,7 +1021,7 @@ ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
     colour = "black"
   ) +
   
-  # labels for top SNPs – no big boxes, just text with small nudges
+  
   geom_text_repel(
     data  = top_snps,
     aes(x = pos, y = -log10(P_PSP), label = SNP),
@@ -1037,7 +1033,7 @@ ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
     label.size    = NA        # removes the rectangle box
   ) +
   
-  # nicer blue→red gradient (low = pale grey, mid = blue, high = red)
+
   scale_color_gradientn(
     colours = c("grey85", "royalblue3", "red3"),
     values  = scales::rescale(c(0, 0.1, max(plot_df$SNP.PP.H4, na.rm = TRUE))),
@@ -1111,10 +1107,10 @@ p_psp_zoom <- ggplot(plot_df, aes(x = pos, y = -log10(P_PSP))) +
     name    = "SNP.PP.H4",
     limits  = c(0, max(plot_df$SNP.PP.H4, na.rm = TRUE))
   ) +
-  # 🔹 genome-wide + suggestive lines
+ 
   geom_hline(yintercept = gws_line,  linetype = "dashed", colour = "darkred") +
   geom_hline(yintercept = sugg_line, linetype = "dotted", colour = "grey40") +
-  # 🔹 zoom to top region (x) and focus y on top signals
+ 
   coord_cartesian(xlim = c(x_min, x_max),
                   ylim = c(sugg_line - 1, max(-log10(plot_df$P_PSP), na.rm = TRUE) + 1)) +
   theme_classic(base_size = 14) +
@@ -1167,4 +1163,5 @@ p_psp_zoom + p_als_zoom + plot_layout(guides = "collect") &
   theme(legend.position = "right")
 
 ```
+
 
