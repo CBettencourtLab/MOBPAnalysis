@@ -1,0 +1,172 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+eqtls_oli <- read_tsv("MOBP_FunGenADv1.ROSMAP_CUIMC1_2_MIT.snuc-eQTL.oli._v1_3_snp_all.20260330_hg38.tsv")
+
+eqtls_oli <- as.data.frame(subset(eqtls_oli, target_gene_symbol == "MOBP"))
+
+```
+
+```{r}
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(coloc)
+library(ggplot2)
+
+
+make_eqtl_dataset <- function(eqtl_df, N = 737) {
+  
+  dat <- eqtl_df %>%
+    filter(target_gene_symbol == "MOBP") %>%
+    mutate(
+      SNP = str_extract(QC_info, "rs[0-9]+"),
+      MAF = ifelse(non_ref_af > 0.5, 1 - non_ref_af, non_ref_af)
+    ) %>%
+    filter(
+      !is.na(SNP),
+      !is.na(beta_non_ref),
+      !is.na(beta_se_non_ref),
+      !is.na(MAF)
+    ) %>%
+    distinct(SNP, .keep_all = TRUE)
+  
+  list(
+    snp     = dat$SNP,
+    beta    = dat$beta_non_ref,
+    varbeta = dat$beta_se_non_ref^2,
+    MAF     = dat$MAF,
+    N       = N,
+    type    = "quant"
+  )
+}
+
+dataset_eqtl_oli <- make_eqtl_dataset(
+  eqtl_df = eqtls_oli,
+  N = 737
+)
+```
+
+```{r}
+
+res_eqtl_oli_psp <- coloc.abf(
+  dataset1 = dataset_psp,
+  dataset2 = dataset_eqtl_oli
+)
+
+res_eqtl_oli_als <- coloc.abf(
+  dataset1 = dataset_als,
+  dataset2 = dataset_eqtl_oli
+)
+
+res_eqtl_oli_mqtl <- coloc.abf(
+  dataset1 = dataset.mqtl,
+  dataset2 = dataset_eqtl_oli
+)
+```
+
+```{r}
+
+coloc_summary_row <- function(res, comparison_name) {
+  as_tibble_row(as.list(res$summary)) %>%
+    mutate(comparison = comparison_name, .before = 1)
+}
+
+eqtl_oli_coloc_summary <- bind_rows(
+  coloc_summary_row(res_eqtl_oli_psp,  "PSP vs OLG eQTL"),
+  coloc_summary_row(res_eqtl_oli_als,  "ALS vs OLG eQTL"),
+  coloc_summary_row(res_eqtl_oli_mqtl, "mQTL vs OLG eQTL")
+) %>%
+  mutate(
+    across(
+      .cols = -comparison,
+      .fns = as.numeric
+    )
+  )
+
+eqtl_oli_coloc_summary
+```
+```{r}
+eqtl_oli_bar_df <- eqtl_oli_coloc_summary %>%
+  dplyr::select(
+    comparison,
+    H0 = PP.H0.abf,
+    H1 = PP.H1.abf,
+    H2 = PP.H2.abf,
+    H3 = PP.H3.abf,
+    H4 = PP.H4.abf
+  ) %>%
+  pivot_longer(
+    cols = H0:H4,
+    names_to = "hypothesis",
+    values_to = "posterior"
+  ) %>%
+  mutate(
+    comparison = factor(
+      comparison,
+      levels = c("mQTL vs OLG eQTL", "PSP vs OLG eQTL", "ALS vs OLG eQTL"),
+      labels = c("mQTL", "PSP", "ALS")
+    ),
+    hypothesis = factor(
+      hypothesis,
+      levels = c("H4", "H3", "H2", "H1", "H0")
+    )
+  )
+```
+
+```{r}
+
+coloc_cols <- c(
+  "H0" = "#3B6EA5",
+  "H1" = "#A9D18E",
+  "H2" = "#FFF7AE",
+  "H3" = "#F4A259",
+  "H4" = "#B22222"
+)
+
+p_eqtl_oli_coloc_bar <- ggplot(
+  eqtl_oli_bar_df,
+  aes(x = comparison, y = posterior, fill = hypothesis)
+) +
+  geom_col(
+    width = 0.75,
+    colour = "black",
+    linewidth = 0.15,
+    position = position_stack(reverse = TRUE)
+  ) +
+  scale_fill_manual(
+    values = coloc_cols,
+    breaks = c("H0", "H1", "H2", "H3", "H4"),
+    labels = c(
+      "H0: neither",
+      "H1: first trait only",
+      "H2: OLG eQTL only",
+      "H3: both, distinct",
+      "H4: both, shared"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "MOBP oligodendrocyte eQTL colocalisation",
+    x = NULL,
+    y = "Posterior probability",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(size = 10),
+    legend.position = "right"
+  )
+
+p_eqtl_oli_coloc_bar
+```
