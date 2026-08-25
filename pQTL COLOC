@@ -1,0 +1,375 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+pqtl <- read.table("ROSMAP_DLPFC_pQTL_chr3_MOBP_region.tsv")
+
+colnames(pqtl) <- c(
+  "chrom",
+  "chromStart",
+  "chromEnd",
+  "variant_id",
+  "pval",
+  "target_strand",
+  "ref",
+  "alt",
+  "target_gene_symbol",
+  "target_ensembl_id",
+  "target",
+  "z_score_non_ref",
+  "beta_non_ref",
+  "beta_se_non_ref",
+  "FDR",
+  "non_ref_af",
+  "qtl_dist_to_target",
+  "QC_info",
+  "target_info",
+  "user_input"
+)
+
+pqtl_MOBP <- subset(pqtl, target_gene_symbol == "MOBP")
+head(pqtl_MOBP)
+
+library(stringr)
+
+pqtl_MOBP$rsid <- str_extract(pqtl_MOBP$QC_info, "rs[0-9]+")
+
+```
+
+```{r}
+library(dplyr)
+library(stringr)
+library(coloc)
+
+
+pqtl_coloc <- pqtl_MOBP %>%
+  transmute(
+    SNP = rsid,
+    beta_pqtl = beta_non_ref,
+    se_pqtl = beta_se_non_ref,
+    p_pqtl = pval,
+    maf = non_ref_af,
+    N_pqtl = 416
+  ) %>%
+  filter(!is.na(beta_pqtl), !is.na(se_pqtl), !is.na(p_pqtl), !is.na(maf)) %>%
+  distinct(SNP, .keep_all = TRUE)
+
+
+dataset_pqtl <- list(
+  snp = pqtl_coloc$SNP,
+  beta = pqtl_coloc$beta_pqtl,
+  varbeta = pqtl_coloc$se_pqtl^2,
+  type = "quant",
+  N = 416,
+  MAF = pqtl_coloc$maf
+)
+
+dataset_psp <- datasets$PSP
+
+res_pqtl_psp <- coloc.abf(
+  dataset1 = dataset_psp,
+  dataset2 = dataset_pqtl
+)
+
+dataset_als <- datasets$ALS
+
+res_pqtl_als <- coloc.abf(
+  dataset1 = dataset_als,
+  dataset2 = dataset_pqtl
+)
+res_pqtl_psp$summary
+
+res_pqtl_als$summary
+
+res_pqtl_psp$results %>%
+  arrange(desc(SNP.PP.H4)) %>%
+  head(20)
+
+
+
+```
+```{r}
+
+cpg_id <- "cg15069948"   # change if needed
+
+## Subset mQTLs for this CpG
+mqtl_x <- mqtls[molecular_trait_id == cpg_id]
+
+## Alias SNP -> snp for coloc
+mqtl_x[, snp := SNP]
+
+## De-dup and QC
+mqtl_x <- mqtl_x[!duplicated(snp)]
+
+mqtl_x <- mqtl_x[
+  !is.na(beta) &
+    !is.na(se) &
+    !is.na(MAF) &
+    !is.na(snp) &
+    MAF > 0 &
+    MAF < 0.5
+]
+
+## Check
+nrow(mqtl_x)
+head(mqtl_x)
+
+## Build coloc-formatted mQTL dataset
+dataset.mqtl <- list(
+  snp     = mqtl_x$snp,
+  beta    = mqtl_x$beta,
+  varbeta = mqtl_x$se^2,
+  MAF     = mqtl_x$MAF,
+  N       = mqtl_x$n[1],     # or set manually, e.g. 636
+  type    = "quant"
+)
+
+## Optional sanity checks
+length(dataset.mqtl$snp)
+head(dataset.mqtl$snp)
+head(dataset.mqtl$beta)
+head(dataset.mqtl$varbeta)
+dataset.mqtl$N
+
+
+res_pqtl_mqtl <- coloc.abf(
+  dataset1 = dataset_pqtl,
+  dataset2 = dataset.mqtl
+)
+```
+
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+res_pqtl_mqtl <- coloc.abf(
+  dataset1 = dataset.mqtl,
+  dataset2 = dataset_pqtl
+)
+res_pqtl_psp <- coloc.abf(
+  dataset1 = dataset_psp,
+  dataset2 = dataset_pqtl
+)
+
+dataset_als <- datasets$ALS
+
+res_pqtl_als <- coloc.abf(
+  dataset1 = dataset_als,
+  dataset2 = dataset_pqtl
+)
+res_pqtl_psp$summary
+
+res_pqtl_als$summary
+
+res_pqtl_psp$results %>%
+  arrange(desc(SNP.PP.H4)) %>%
+  head(20)
+coloc_cols <- c(
+  H0 = "#3B6EA5",  # muted blue
+  H1 = "#A9D18E",  # soft green
+  H2 = "#FFF7AE",  # pale yellow
+  H3 = "#F4A259",  # muted orange
+  H4 = "#B22222"   # deep red
+)
+
+
+
+pqtl_coloc_summary <- tibble(
+  comparison = c("ALS", "PSP"),
+  H0 = c(as.numeric(res_pqtl_als$summary["PP.H0.abf"]),
+         as.numeric(res_pqtl_psp$summary["PP.H0.abf"])),
+  H1 = c(as.numeric(res_pqtl_als$summary["PP.H1.abf"]),
+         as.numeric(res_pqtl_psp$summary["PP.H1.abf"])),
+  H2 = c(as.numeric(res_pqtl_als$summary["PP.H2.abf"]),
+         as.numeric(res_pqtl_psp$summary["PP.H2.abf"])),
+  H3 = c(as.numeric(res_pqtl_als$summary["PP.H3.abf"]),
+         as.numeric(res_pqtl_psp$summary["PP.H3.abf"])),
+  H4 = c(as.numeric(res_pqtl_als$summary["PP.H4.abf"]),
+         as.numeric(res_pqtl_psp$summary["PP.H4.abf"]))
+) %>%
+  tidyr::pivot_longer(H0:H4, names_to = "hypothesis", values_to = "posterior") %>%
+  mutate(
+    hypothesis = factor(hypothesis, levels = c("H4", "H3", "H2", "H1", "H0")),
+    comparison = factor(comparison, levels = c("ALS", "PSP"))
+  )
+h4_labels <- pqtl_coloc_summary %>%
+  filter(hypothesis == "H4") %>%
+  mutate(
+    label = paste0("PP.H4 = ", sprintf("%.2f", posterior))
+  )
+coloc_cols <- c(
+  H0 = "#3B6EA5",
+  H1 = "#A9D18E",
+  H2 = "#FFF7AE",
+  H3 = "#F4A259",
+  H4 = "#B22222"
+)
+
+p_pqtl_coloc_bar <- ggplot(
+  pqtl_coloc_summary,
+  aes(x = comparison, y = posterior, fill = hypothesis)
+) +
+  geom_col(width = 0.8, colour = "grey25", linewidth = 0.25) +
+  scale_fill_manual(
+    values = coloc_cols,
+    labels = c(
+      H4 = "H4: both, shared",
+      H3 = "H3: both, distinct",
+      H2 = "H2: pQTL only",
+      H1 = "H1: disease only",
+      H0 = "H0: neither"
+    )
+  ) + geom_text(
+  data = h4_labels,
+  aes(
+    x = comparison,
+    y = posterior / 2,
+    label = label
+  ),
+  colour = "white",
+  fontface = "bold",
+  size = 4
+) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25), expand = c(0, 0)) +
+  labs(
+    title = "Disease vs MOBP pQTL",
+    x = NULL,
+    y = "Posterior probability",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 14)
+
+p_pqtl_coloc_bar
+```
+
+```{r}
+
+res_pqtl_mqtl <- coloc.abf(
+  dataset1 = dataset.mqtl,
+  dataset2 = dataset_pqtl
+)
+res_pqtl_psp <- coloc.abf(
+  dataset1 = dataset_psp,
+  dataset2 = dataset_pqtl
+)
+
+dataset_als <- datasets$ALS
+
+res_pqtl_als <- coloc.abf(
+  dataset1 = dataset_als,
+  dataset2 = dataset_pqtl
+)
+
+
+pqtl_coloc_summary <- tibble(
+  comparison = c("ALS vs pQTL", "PSP vs pQTL", "mQTL vs pQTL"),
+  H0 = c(
+    as.numeric(res_pqtl_als$summary["PP.H0.abf"]),
+    as.numeric(res_pqtl_psp$summary["PP.H0.abf"]),
+    as.numeric(res_pqtl_mqtl$summary["PP.H0.abf"])
+  ),
+  H1 = c(
+    as.numeric(res_pqtl_als$summary["PP.H1.abf"]),
+    as.numeric(res_pqtl_psp$summary["PP.H1.abf"]),
+    as.numeric(res_pqtl_mqtl$summary["PP.H1.abf"])
+  ),
+  H2 = c(
+    as.numeric(res_pqtl_als$summary["PP.H2.abf"]),
+    as.numeric(res_pqtl_psp$summary["PP.H2.abf"]),
+    as.numeric(res_pqtl_mqtl$summary["PP.H2.abf"])
+  ),
+  H3 = c(
+    as.numeric(res_pqtl_als$summary["PP.H3.abf"]),
+    as.numeric(res_pqtl_psp$summary["PP.H3.abf"]),
+    as.numeric(res_pqtl_mqtl$summary["PP.H3.abf"])
+  ),
+  H4 = c(
+    as.numeric(res_pqtl_als$summary["PP.H4.abf"]),
+    as.numeric(res_pqtl_psp$summary["PP.H4.abf"]),
+    as.numeric(res_pqtl_mqtl$summary["PP.H4.abf"])
+  )
+) %>%
+  tidyr::pivot_longer(
+    H0:H4,
+    names_to = "hypothesis",
+    values_to = "posterior"
+  ) %>%
+  mutate(
+    comparison = factor(
+      comparison,
+      levels = c("ALS vs pQTL", "PSP vs pQTL", "mQTL vs pQTL")
+    ),
+    hypothesis = factor(
+      hypothesis,
+      levels = c("H4", "H3", "H2", "H1", "H0")
+    )
+  )
+
+
+h4_labels <- pqtl_coloc_summary %>%
+  group_by(comparison) %>%
+  arrange(hypothesis, .by_group = TRUE) %>%
+  mutate(
+    ymin = cumsum(posterior) - posterior,
+    ymax = cumsum(posterior),
+    y = ymin + posterior / 2
+  ) %>%
+  ungroup() %>%
+  filter(hypothesis == "H4") %>%
+  mutate(
+    label = paste0("PP.H4 = ", sprintf("%.2f", posterior))
+  )
+
+
+p_pqtl_coloc_bar <- ggplot(
+  pqtl_coloc_summary,
+  aes(x = comparison, y = posterior, fill = hypothesis)
+) +
+  geom_col(width = 0.8, colour = "grey25", linewidth = 0.25) +
+  geom_text(
+    data = h4_labels,
+    aes(x = comparison, y = y, label = label),
+    colour = "white",
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_fill_manual(
+    values = coloc_cols,
+    breaks = c("H4", "H3", "H2", "H1", "H0"),
+    labels = c(
+      H4 = "H4: both, shared",
+      H3 = "H3: both, distinct",
+      H2 = "H2: trait 2 only",
+      H1 = "H1: trait 1 only",
+      H0 = "H0: neither"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "MOBP pQTL colocalisation",
+    x = NULL,
+    y = "Posterior probability",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 12),
+    plot.title = element_text(face = "bold")
+  )
+
+p_pqtl_coloc_bar
+```
