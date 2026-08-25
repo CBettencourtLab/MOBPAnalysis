@@ -1,0 +1,259 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+
+library(dplyr)
+
+
+mqtls_wide <- mqtls %>%
+  select(
+    SNP  = SNP,
+    cpg = molecular_trait_id,
+    p_mqtl = pvalue,
+    beta_mqtl = beta
+  ) %>%
+  distinct()
+
+
+mqtls_wide <- mqtls_wide %>%
+  left_join(ALS_f %>% select(SNP, p_ALS = P), by = "SNP") %>%
+  left_join(PSP_f %>% select(SNP, p_PSP = P), by = "SNP") %>%
+  left_join(FTD_h %>% select(SNP, p_FTD = P), by = "SNP")
+
+head(mqtls_wide)
+
+corr_by_cpg <- mqtls_wide %>%
+  mutate(
+    logp_ALS = -log10(p_ALS),
+    logp_PSP = -log10(p_PSP),
+    logp_FTD = -log10(p_FTD), 
+    logp_mqtls = -log10(p_mqtl)
+  ) %>%
+  group_by(cpg) %>%
+  summarise(
+    n_snps      = sum(!is.na(logp_ALS) & !is.na(logp_PSP) & !is.na(logp_FTD)),
+    cor_ALS_mqtls = cor(logp_ALS, logp_mqtls, use = "pairwise.complete.obs"),
+    cor_FTD_mqtls = cor(logp_FTD, logp_mqtls, use = "pairwise.complete.obs"),
+    cor_PSP_mqtls = cor(logp_PSP, logp_mqtls, use = "pairwise.complete.obs"),
+    .groups = "drop"
+  ) 
+
+corr_by_cpg %>% head()
+
+```
+
+```{r}
+run_abf_pair <- function(ds1, ds2, name1, name2,
+                         p1 = 1e-3, p2 = 1e-3, p12 = 1e-5) {
+
+  res <- coloc.abf(
+    dataset1 = ds1,
+    dataset2 = ds2,
+    p1 = p1,
+    p2 = p2,
+    p12 = p12
+  )
+
+  tibble(
+    trait1 = name1,
+    trait2 = name2,
+    nsnps  = as.numeric(res$summary["nsnps"]),
+    H0     = as.numeric(res$summary["PP.H0.abf"]),
+    H1     = as.numeric(res$summary["PP.H1.abf"]),
+    H2     = as.numeric(res$summary["PP.H2.abf"]),
+    H3     = as.numeric(res$summary["PP.H3.abf"]),
+    H4     = as.numeric(res$summary["PP.H4.abf"])
+  )
+}
+
+cpg_ids <- unique(mqtls_std$cpg)
+
+mqtl_coloc_all <- purrr::map_dfr(cpg_ids, function(cpg_id) {
+  message("\n=== CpG ", cpg_id, " ===")
+
+ 
+  ds_mqtl <- tryCatch(
+    build_mqtl_coloc_dataset(cpg_id, mqtls, ld_ref),
+    error = function(e) {
+      message("  Skipping ", cpg_id, " (build failed: ", e$message, ")")
+      return(NULL)
+    }
+  )
+
+  if (is.null(ds_mqtl)) return(NULL)
+
+
+  res_psp <- tryCatch(
+    run_abf_pair(dataset.psp, ds_mqtl,
+                 name1 = "PSP",
+                 name2 = paste0("mQTL_", cpg_id)),
+    error = function(e) {
+      message("  PSP coloc failed for ", cpg_id, ": ", e$message)
+      return(NULL)
+    }
+  )
+
+ 
+  res_als <- tryCatch(
+    run_abf_pair(dataset.als, ds_mqtl,
+                 name1 = "ALS",
+                 name2 = paste0("mQTL_", cpg_id)),
+    error = function(e) {
+      message("  ALS coloc failed for ", cpg_id, ": ", e$message)
+      return(NULL)
+    }
+  )
+
+  
+  res_ftd <- tryCatch(
+    run_abf_pair(dataset.ftd, ds_mqtl,
+                 name1 = "FTD",
+                 name2 = paste0("mQTL_", cpg_id)),
+    error = function(e) {
+      message("  FTD coloc failed for ", cpg_id, ": ", e$message)
+      return(NULL)
+    }
+  )
+
+  dplyr::bind_rows(
+    res_psp  %>% dplyr::mutate(cpg = cpg_id),
+    res_als  %>% dplyr::mutate(cpg = cpg_id),
+    res_ftd  %>% dplyr::mutate(cpg = cpg_id)
+  )
+})
+
+
+mqtl_coloc_all
+```
+```{r build_mqtl_dataset_with_ld}
+library(dplyr)
+
+attach_ld_mqtl <- function(ds, trait_label = "mQTL") {
+  # match to LD reference
+  idx  <- match(ds$snp, ld_ref$snp)
+  keep <- !is.na(idx)
+
+  if (sum(keep) < 10) {
+    warning(trait_label, ": only ", sum(keep), " SNPs match LD reference")
+  }
+
+  
+  ds$snp     <- ds$snp[keep]
+  ds$beta    <- ds$beta[keep]
+  ds$varbeta <- ds$varbeta[keep]
+  ds$MAF     <- ds$MAF[keep]
+  ds$A1      <- ds$A1[keep]
+  ds$A2      <- ds$A2[keep]
+  if (!is.null(ds$pos)) ds$pos <- ds$pos[keep]
+
+  a1_ref <- ld_ref$A1_ref[idx[keep]]
+  a2_ref <- ld_ref$A2_ref[idx[keep]]
+
+  
+  flip <- ds$A1 != a1_ref & ds$A1 == a2_ref
+  ds$beta[flip] <- -ds$beta[flip]
+
+
+  mismatch <- !(
+    (ds$A1 == a1_ref & ds$A2 == a2_ref) |
+    (ds$A1 == a2_ref & ds$A2 == a1_ref)
+  )
+
+  if (any(mismatch, na.rm = TRUE)) {
+    message(trait_label, ": dropping ", sum(mismatch, na.rm = TRUE),
+            " SNPs with incompatible alleles vs LD ref")
+
+    keep2 <- !mismatch
+    ds$snp     <- ds$snp[keep2]
+    ds$beta    <- ds$beta[keep2]
+    ds$varbeta <- ds$varbeta[keep2]
+    ds$MAF     <- ds$MAF[keep2]
+    ds$A1      <- ds$A1[keep2]
+    ds$A2      <- ds$A2[keep2]
+    if (!is.null(ds$pos)) ds$pos <- ds$pos[keep2]
+
+    idx <- idx[keep][keep2]
+  } else {
+    idx <- idx[keep]
+  }
+
+  # subset LD matrix
+  ds$LD <- R_all[idx, idx]
+
+  message(trait_label, ": attached LD for ", length(ds$snp), " SNPs")
+
+  ds
+}
+
+```
+
+```{r runsusie_cc}
+library(susieR)
+
+runsusie_cc <- function(ds, L = 10, maxit = 10000, trait_label = NULL) {
+  z <- ds$beta / sqrt(ds$varbeta)
+  R <- ds$LD
+
+  # Small shrinkage to stabilise LD (keeps diag ~1, shrinks off-diagonals a bit)
+  R <- 0.99 * R + 0.01 * diag(nrow(R))
+
+  # First attempt: standard susie_rss
+  susie_fit <- try(
+    susie_rss(
+      z        = z,
+      R        = R,
+      n        = ds$N,
+      L        = L,
+      coverage = 0.95,
+      max_iter = maxit
+    ),
+    silent = TRUE
+  )
+
+  # If that failed with the "prior variance" error, retry with fixed prior variance
+  if (inherits(susie_fit, "try-error")) {
+    msg <- conditionMessage(attr(susie_fit, "condition"))
+    if (!is.null(trait_label)) {
+      message(trait_label, ": susie_rss failed, retrying with fixed prior_variance. Original error: ", msg)
+    } else {
+      message("susie_rss failed, retrying with fixed prior_variance. Original error: ", msg)
+    }
+
+    susie_fit <- susie_rss(
+      z        = z,
+      R        = R,
+      n        = ds$N,
+      L        = L,
+      coverage = 0.95,
+      max_iter = maxit,
+      estimate_prior_variance = FALSE,
+      prior_variance          = 0.05   # you can tweak this (e.g. 0.01–0.1)
+    )
+  }
+
+  # Attach SNP IDs and positions for plotting
+  susie_fit$snp <- ds$snp
+  if (!is.null(ds$pos)) susie_fit$pos <- ds$pos
+  susie_fit$label <- ds$label
+
+  susie_fit
+}
+
+
+```
+
+```{r}
+
+cpg_id <- "cg15069948"  # Top CpG 
+
+mqtl_cpg <- build_mqtl_dataset_with_ld(cpg_id)
+
+susie_mqtl_cpg <- runsusie_cc(mqtl_cpg, L = 10, maxit = 10000)
+
+```
