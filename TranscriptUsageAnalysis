@@ -1,0 +1,602 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+## 0. Libraries
+
+library(dplyr)
+library(data.table)
+library(tibble)
+library(ggplot2)
+library(ggpubr)
+library(stringr)
+
+```
+
+```{r}
+
+
+load("BDR_Pheno.Rdata")
+
+pcs <- fread("bdr_pca.eigenvec", header = TRUE)
+
+geno_pc_cols <- grep("^PC", colnames(pcs), value = TRUE)
+
+colnames(pcs)[colnames(pcs) %in% geno_pc_cols] <-
+  paste0("geno_", geno_pc_cols)
+
+bdrPhenoAll <- bdrPhenoAll %>%
+  left_join(pcs, by = c("DNA_ID" = "IID"))
+
+stopifnot(all(paste0("geno_PC", 1:5) %in% colnames(bdrPhenoAll)))
+```
+
+```{r}
+
+
+
+bdrPhenoAll <- bdrPhenoAll %>%
+  filter(!is.na(X3.39523003_C)) %>%
+  mutate(
+    rs1768208_genotype = case_when(
+      X3.39523003_C == 0 ~ "TT",
+      X3.39523003_C == 1 ~ "TC",
+      X3.39523003_C == 2 ~ "CC",
+      TRUE ~ NA_character_
+    ),
+    rs1768208_genotype = factor(
+      rs1768208_genotype,
+      levels = c("CC", "TC", "TT")
+    ),
+    T_carrier = case_when(
+      X3.39523003_C %in% c(0, 1) ~ 1,
+      X3.39523003_C == 2 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    T_carrier_label = factor(
+      case_when(
+        T_carrier == 1 ~ "T carrier",
+        T_carrier == 0 ~ "CC",
+        TRUE ~ NA_character_
+      ),
+      levels = c("CC", "T carrier")
+    )
+  )
+
+table(bdrPhenoAll$rs1768208_genotype, useNA = "ifany")
+table(bdrPhenoAll$T_carrier_label, useNA = "ifany")
+```
+
+```{r}
+
+cpg_model <- lm(
+  cg15069948 ~
+    Age +
+    as.factor(Gender) +
+    as.factor(Plate) +
+    NeuNNeg_SOX10Pos,
+  data = bdrPhenoAll,
+  na.action = na.exclude
+)
+
+bdrPhenoAll$cg15069948_adj <- resid(cpg_model) + coef(cpg_model)[1]
+
+summary(bdrPhenoAll$cg15069948_adj)
+
+ggplot(bdrPhenoAll, aes(x = T_carrier_label, y = cg15069948_adj)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.7) +
+  stat_compare_means(method = "wilcox.test") +
+  theme_classic()
+```
+
+```{r}
+
+
+counts_raw <- fread("BDR_chr3_clustered_perind_numers.counts.gz")
+counts_raw <- as.data.frame(counts_raw)
+
+rownames(counts_raw) <- counts_raw$V1
+
+parts <- do.call(rbind, strsplit(counts_raw$V1, "[:_]"))
+colnames(parts) <- c("CHR", "BP_1", "BP_2", "annot", "index", "strand")
+
+
+parts <- as.data.frame(parts)
+rownames(parts) <- rownames(counts_raw)
+
+parts$BP_1 <- as.numeric(parts$BP_1)
+parts$BP_2 <- as.numeric(parts$BP_2)
+parts$cluster <- paste0(parts$annot, "_", parts$index)
+
+counts <- counts_raw[, -1]
+
+counts <- counts[, !grepl("nc|NTC", colnames(counts), ignore.case = TRUE)]
+
+
+sample_map <- tibble(old_col = colnames(counts)) %>%
+  mutate(
+    clean_col = old_col,
+    clean_col = gsub("10202_", "", clean_col),
+    clean_col = gsub("_Aligned.sortedByCoord.out.bam", "", clean_col)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    clean_col = {
+      name_string <- strsplit(clean_col, "_")[[1]]
+      paste(name_string[-length(name_string)], collapse = "")
+    }
+  ) %>%
+  ungroup()
+
+colnames(counts) <- sample_map$clean_col
+```
+
+```{r}
+
+
+mobp_start_hg38 <- 39467172
+mobp_end_hg38   <- 39529497
+
+keep_mobp <- parts$CHR == "chr3" &
+  parts$BP_1 <= mobp_end_hg38 &
+  parts$BP_2 >= mobp_start_hg38
+
+parts_mobp <- parts[keep_mobp, ]
+counts_mobp <- counts[rownames(parts_mobp), ]
+
+dim(counts_mobp)
+table(parts_mobp$cluster)
+```
+
+```{r}
+
+
+pheno <- bdrPhenoAll[match(colnames(counts_mobp), bdrPhenoAll$joinVar), ]
+
+missing_pheno <- colnames(counts_mobp)[is.na(pheno$joinVar)]
+
+cat("Samples in counts but missing phenotype:", length(missing_pheno), "\n")
+print(missing_pheno)
+
+keep_samples <- !is.na(pheno$joinVar)
+
+counts_mobp <- counts_mobp[, keep_samples, drop = FALSE]
+pheno <- pheno[keep_samples, ]
+
+rownames(pheno) <- pheno$joinVar
+
+stopifnot(all(rownames(pheno) == colnames(counts_mobp)))
+
+table(pheno$rs1768208_genotype, useNA = "ifany")
+table(pheno$T_carrier_label, useNA = "ifany")
+```
+
+```{r}
+
+usage_mat <- counts_mobp
+
+for (clu in unique(parts_mobp$cluster)) {
+  
+  idx <- which(parts_mobp$cluster == clu)
+  
+  cluster_total <- colSums(
+    counts_mobp[idx, , drop = FALSE],
+    na.rm = TRUE
+  )
+  
+  usage_mat[idx, ] <- sweep(
+    counts_mobp[idx, , drop = FALSE],
+    2,
+    cluster_total,
+    "/"
+  )
+}
+
+usage_mat[is.nan(as.matrix(usage_mat))] <- NA
+
+
+clu_test <- unique(parts_mobp$cluster)[1]
+
+colSums(
+  usage_mat[parts_mobp$cluster == clu_test, , drop = FALSE],
+  na.rm = TRUE
+)[1:10]
+
+stopifnot(all(colnames(usage_mat) == rownames(pheno)))
+```
+
+```{r}
+
+cluster_total_mat <- matrix(
+  NA,
+  nrow = nrow(counts_mobp),
+  ncol = ncol(counts_mobp),
+  dimnames = list(rownames(counts_mobp), colnames(counts_mobp))
+)
+
+for (clu in unique(parts_mobp$cluster)) {
+  
+  idx <- which(parts_mobp$cluster == clu)
+  
+  cluster_total <- colSums(
+    counts_mobp[idx, , drop = FALSE],
+    na.rm = TRUE
+  )
+  
+  cluster_total_mat[idx, ] <- matrix(
+    cluster_total,
+    nrow = length(idx),
+    ncol = ncol(counts_mobp),
+    byrow = TRUE
+  )
+}
+
+mean_cluster_reads <- rowMeans(cluster_total_mat, na.rm = TRUE)
+intron_total_reads <- rowSums(counts_mobp, na.rm = TRUE)
+
+keep_introns <- mean_cluster_reads >= 20 & intron_total_reads >= 20
+
+usage_mat_filt <- usage_mat[keep_introns, , drop = FALSE]
+counts_mobp_filt <- counts_mobp[keep_introns, , drop = FALSE]
+parts_mobp_filt <- parts_mobp[keep_introns, , drop = FALSE]
+
+dim(usage_mat_filt)
+table(parts_mobp_filt$cluster)
+
+stopifnot(all(colnames(usage_mat_filt) == rownames(pheno)))
+
+usage_for_models <- usage_mat
+
+```
+
+```{r}
+
+
+usage_for_models <- usage_mat  
+stopifnot(all(colnames(usage_for_models) == rownames(pheno)))
+
+results_list_Tcarrier <- lapply(seq_len(nrow(usage_for_models)), function(i) {
+  
+  y <- as.numeric(usage_for_models[i, ])
+  
+  df <- data.frame(
+    expr = y,
+    X3 = pheno$X3.39523003_C,
+    T_carrier = pheno$T_carrier,
+    T_carrier_label = pheno$T_carrier_label,
+    cg = pheno$cg15069948_adj,
+    NeuNNeg_SOX10Pos = pheno$NeuNNeg_SOX10Pos,
+    RIN = pheno$RIN,
+    Age = pheno$Age,
+    Gender = factor(pheno$Gender)
+  )
+  
+  df <- df[complete.cases(df), ]
+  
+  fit <- lm(
+    expr ~ T_carrier + Age + RIN + Gender + NeuNNeg_SOX10Pos,
+    data = df
+  )
+  
+  fit2 <- lm(
+    expr ~ cg + Age + RIN + Gender + NeuNNeg_SOX10Pos,
+    data = df
+  )
+  
+  fit3 <- lm(
+    expr ~ T_carrier * cg + Age + RIN + Gender + NeuNNeg_SOX10Pos,
+    data = df
+  )
+  
+  s <- summary(fit)$coefficients
+  s2 <- summary(fit2)$coefficients
+  s3 <- summary(fit3)$coefficients
+  
+  data.frame(
+    gene = rownames(usage_for_models)[i],
+    
+    T_carrier_beta = s["T_carrier", "Estimate"],
+    T_carrier_p = s["T_carrier", "Pr(>|t|)"],
+    
+    cg_beta = s2["cg", "Estimate"],
+    cg_p = s2["cg", "Pr(>|t|)"],
+    
+    interaction_beta = s3["T_carrier:cg", "Estimate"],
+    interaction_p = s3["T_carrier:cg", "Pr(>|t|)"],
+    
+    n = nrow(df),
+    n_CC = sum(df$T_carrier == 0),
+    n_T_carrier = sum(df$T_carrier == 1)
+  )
+})
+
+results_Tcarrier <- do.call(rbind, results_list_Tcarrier)
+rownames(results_Tcarrier) <- results_Tcarrier$gene
+
+results_Tcarrier <- results_Tcarrier[order(results_Tcarrier$interaction_p), ]
+
+head(results_Tcarrier, 20)
+```
+```{r}
+load("~/gencode_gff_fortranscripts.RData")
+```
+
+
+
+```{r Plotting}
+library(rtracklayer)
+clu890 <- results_Tcarrier %>%
+  as.data.frame() %>%
+  filter(grepl("clu_890", gene))
+
+tmp <- do.call(rbind, strsplit(clu890$gene, ":"))
+
+junctions_hg38 <- clu890 %>%
+  mutate(
+    seqid = tmp[, 1],
+    BP_1_hg38 = as.numeric(tmp[, 2]),
+    BP_2_hg38 = as.numeric(tmp[, 3])
+  )
+
+
+# LiftOver hg38 -> hg19
+
+chain <- import.chain("hg38ToHg19.over.chain")
+
+gr_start <- GRanges(
+  seqnames = junctions_hg38$seqid,
+  ranges = IRanges(
+    start = junctions_hg38$BP_1_hg38,
+    end = junctions_hg38$BP_1_hg38
+  )
+)
+
+gr_end <- GRanges(
+  seqnames = junctions_hg38$seqid,
+  ranges = IRanges(
+    start = junctions_hg38$BP_2_hg38,
+    end = junctions_hg38$BP_2_hg38
+  )
+)
+
+lo_start <- liftOver(gr_start, chain)
+lo_end <- liftOver(gr_end, chain)
+
+
+keep <- lengths(lo_start) == 1 & lengths(lo_end) == 1
+
+junctions_hg19 <- junctions_hg38[keep, ]
+
+junctions_hg19$BP_1_hg19 <- start(unlist(lo_start[keep]))
+junctions_hg19$BP_2_hg19 <- start(unlist(lo_end[keep]))
+
+junctions_hg19 <- junctions_hg19 %>%
+  arrange(BP_1_hg19)
+
+junctions_hg19[, c("gene", "BP_1_hg38", "BP_2_hg38", "BP_1_hg19", "BP_2_hg19", "interaction_beta")]
+library(ggplot2)
+
+junctions_hg19 <- junctions_hg19 %>%
+  arrange(BP_1_hg19, BP_2_hg19) %>%
+  mutate(
+    event_id = paste0("J", row_number()),
+    event_label = paste0(event_id, "\n", BP_1_hg19, "–", BP_2_hg19)
+  )
+
+junction_lookup <- junctions_hg19 %>%
+  dplyr::select(event_id, gene, BP_1_hg38, BP_2_hg38, BP_1_hg19, BP_2_hg19, interaction_beta, interaction_p)
+
+junction_lookup
+junctions_hg19 <- junctions_hg19 %>%
+  mutate(
+    sig = ifelse(interaction_p < 0.05, "*", "")
+  )
+ExonsSpreadsheet_Homo_sapiens_Transcript_Exons_ENST00000854240 <- read_csv("ExonsSpreadsheet-Homo_sapiens_Transcript_Exons_ENST00000854240.csv")
+
+mobp_exons_canon <- ExonsSpreadsheet_Homo_sapiens_Transcript_Exons_ENST00000854240
+
+exons_hg38 <- mobp_exons_canon %>%
+  filter(!is.na(No.)) %>%
+  transmute(
+    exon_no = No.,
+    exon_id = `Exon / Intron`,
+    seqid = "chr3",
+    start_hg38 = Start,
+    end_hg38 = End
+  )
+
+gr_exon_start <- GRanges(
+  seqnames = exons_hg38$seqid,
+  ranges = IRanges(
+    start = exons_hg38$start_hg38,
+    end = exons_hg38$start_hg38
+  )
+)
+
+gr_exon_end <- GRanges(
+  seqnames = exons_hg38$seqid,
+  ranges = IRanges(
+    start = exons_hg38$end_hg38,
+    end = exons_hg38$end_hg38
+  )
+)
+
+lo_exon_start <- liftOver(gr_exon_start, chain)
+
+lo_exon_end <- liftOver(gr_exon_end, chain)
+
+keep_exons <- lengths(lo_exon_start) == 1 & lengths(lo_exon_end) == 1
+
+mobp_consensus_exons <- exons_hg38[keep_exons, ] %>%
+  mutate(
+    start = start(unlist(lo_exon_start[keep_exons])),
+    end   = start(unlist(lo_exon_end[keep_exons]))
+  ) %>%
+  dplyr::select(exon_no, exon_id, start, end) %>%
+  arrange(start) %>%
+  filter(exon_no != 3)
+
+junctions_hg19$y <- seq(
+  1.15,
+  1.15 + 0.08 * (nrow(junctions_hg19) - 1),
+  by = 0.08
+)
+
+p2 <- ggplot() +
+  geom_segment(
+    aes(
+      x = min(mobp_consensus_exons$start),
+      xend = max(mobp_consensus_exons$end),
+      y = 1,
+      yend = 1
+    ),
+    linewidth = 0.4
+  ) +
+  geom_rect(
+    data = mobp_consensus_exons,
+    aes(
+      xmin = start,
+      xmax = end,
+      ymin = 0.96,
+      ymax = 1.04
+    ),
+    fill = "grey30"
+  ) +
+  geom_curve(
+    data = junctions_hg19,
+    aes(
+      x = BP_1_hg19,
+      xend = BP_2_hg19,
+      y = y,
+      yend = y,
+      colour = interaction_beta
+    ),
+    curvature = -0.25,
+    linewidth = 1.1
+  ) +
+  geom_vline(
+    xintercept = 39523003,
+    linetype = 2,
+    colour = "black"
+  ) +
+  geom_vline(
+    xintercept = 39544697,
+    linetype = 3,
+    colour = "black"
+  ) +
+  annotate(
+    "text",
+    x = 39523003-700,
+    y = max(junctions_hg19$y) + 0.15,
+    label = "rs1768208",
+    angle = 90,
+    size = 3
+  ) +
+  annotate(
+    "text",
+    x = 39544697-700,
+    y = max(junctions_hg19$y) + 0.15,
+    label = "cg15069948",
+    angle = 90,
+    size = 3
+  ) +
+  scale_colour_gradient2(
+    low = "#2C7FB8",
+    mid = "grey70",
+    high = "#E41A1C",
+    midpoint = 0
+  ) +
+  labs(
+    title = "MOBP Clustered Introns",
+    subtitle = "CpG * Genotype Interactions",
+    x = "Chromosome 3 position (hg19)",
+    y = NULL,
+    colour = "Interaction\nbeta"
+  ) +
+  coord_cartesian(
+    ylim = c(0.85, max(junctions_hg19$y) + 0.35)
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.line.y = element_blank()
+  ) + geom_text(
+  data = junctions_hg19,
+  aes(
+    x = (BP_1_hg19 + BP_2_hg19) / 2,
+    y = y + 0.08,
+    label = sig
+  ),
+  size = 5,
+  fontface = "bold"
+) 
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+top_event <- rownames(results_Tcarrier)[which.min(results_Tcarrier$interaction_p)]
+
+plot_df <- data.frame(
+  expr = as.numeric(usage_for_models[top_event, ]),
+  T_carrier = pheno$T_carrier,
+  T_carrier_label = pheno$T_carrier_label,
+  cg = pheno$cg15069948_adj,
+  NeuNNeg_SOX10Pos = pheno$NeuNNeg_SOX10Pos,
+  RIN = pheno$RIN,
+  Age = pheno$Age,
+  Gender = factor(pheno$Gender)
+)
+
+plot_df <- plot_df[complete.cases(plot_df), ]
+
+
+fit_usage_adj <- lm(
+  expr ~ Age + RIN + Gender + NeuNNeg_SOX10Pos,
+  data = plot_df
+)
+
+plot_df$expr_adj <- resid(fit_usage_adj)
+
+
+interaction_beta <- results_Tcarrier[top_event, "interaction_beta"]
+interaction_p <- results_Tcarrier[top_event, "interaction_p"]
+carrier_cols <- c(
+  "CC" = "#2166ac",
+  "T carrier" = "#b2182b"
+)
+p_interaction <- ggplot(
+  plot_df,
+  aes(
+    x = cg,
+    y = expr_adj,
+    colour = T_carrier_label,
+    fill = T_carrier_label
+  )
+) +
+  geom_point(size = 2.5, alpha = 0.75) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1) +
+  labs(
+    title = "Chr3:39544405:39554874 (hg19)",
+    subtitle = paste0(
+      "Interaction beta = ",
+      signif(interaction_beta, 3),
+      ", p = ",
+      signif(interaction_p, 3)
+    ),
+    x = "Adjusted cg15069948 methylation",
+    y = "Covariate-adjusted splice junction usage",
+    colour = "Genotype",
+    fill = "Genotype"
+  ) +
+  theme_classic() + scale_colour_manual(values = carrier_cols) +
+  scale_fill_manual(values = carrier_cols)
+
+p_interaction
+```
